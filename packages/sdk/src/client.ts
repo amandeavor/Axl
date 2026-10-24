@@ -1,31 +1,32 @@
 // SPDX-FileCopyrightText: 2026 Hari Srinivasan
 // SPDX-FileCopyrightText: 2026 VishnuM449
+// SPDX-FileCopyrightText: 2026 Shaan Narendran
 // SPDX-License-Identifier: Apache-2.0
 
 import {
+  type BlobReference,
+  type CapabilityId,
+  type ClientIdentity,
+  type ConnectionInitializeResult,
   encodeWireMessage,
   isKnownRpcErrorCode,
   isProviderRpcErrorCode,
   isRetryableMutationMethod,
   isRpcErrorAllowed,
-  parseServerMessage,
-  parseWireRequest,
-  requiredCapability,
-  WIRE_PROTOCOL_VERSION,
-  type BlobReference,
-  type CapabilityId,
-  type ClientIdentity,
-  type ConnectionInitializeResult,
   type OperationId,
   type PresenceDelivery,
   type ProviderRpcErrorCode,
   type ProviderRpcErrorDetails,
+  parseServerMessage,
+  parseWireRequest,
   type RpcMethod,
   type RpcParams,
   type RpcResult,
+  requiredCapability,
   type ServerMessage,
   type SessionId,
   type SessionsChangedDelivery,
+  WIRE_PROTOCOL_VERSION,
   type WireActivity,
   type WireEvent,
 } from "@axl/protocol";
@@ -261,6 +262,104 @@ export class AxlClient {
     return this.request("command.list", params, options);
   }
 
+  listExtensions(
+    params: RpcParams<"extension.list">,
+    options: Omit<RequestOptions, "idempotencyKey"> = {},
+  ): Promise<RpcResult<"extension.list">> {
+    return this.request("extension.list", params, options);
+  }
+
+  enableExtension(
+    params: RpcParams<"extension.enable">,
+    options: RequestOptions = {},
+  ): Promise<RpcResult<"extension.enable">> {
+    return this.request("extension.enable", params, options);
+  }
+
+  disableExtension(
+    params: RpcParams<"extension.disable">,
+    options: RequestOptions = {},
+  ): Promise<RpcResult<"extension.disable">> {
+    return this.request("extension.disable", params, options);
+  }
+
+  reloadExtension(
+    params: RpcParams<"extension.reload">,
+    options: RequestOptions = {},
+  ): Promise<RpcResult<"extension.reload">> {
+    return this.request("extension.reload", params, options);
+  }
+
+  installExtension(
+    params: RpcParams<"extension.install">,
+    options: RequestOptions = {},
+  ): Promise<RpcResult<"extension.install">> {
+    return this.request("extension.install", params, options);
+  }
+
+  updateExtension(
+    params: RpcParams<"extension.update">,
+    options: RequestOptions = {},
+  ): Promise<RpcResult<"extension.update">> {
+    return this.request("extension.update", params, options);
+  }
+
+  removeExtension(
+    params: RpcParams<"extension.remove">,
+    options: RequestOptions = {},
+  ): Promise<RpcResult<"extension.remove">> {
+    return this.request("extension.remove", params, options);
+  }
+
+  trustExtensionProject(
+    params: RpcParams<"extension.trust">,
+    options: RequestOptions = {},
+  ): Promise<RpcResult<"extension.trust">> {
+    return this.request("extension.trust", params, options);
+  }
+
+  invokeExtensionCommand(
+    params: RpcParams<"extension.command.invoke">,
+    options: Omit<RequestOptions, "idempotencyKey"> = {},
+  ): Promise<RpcResult<"extension.command.invoke">> {
+    return this.request("extension.command.invoke", params, options);
+  }
+
+  listMcpServers(
+    options: Omit<RequestOptions, "idempotencyKey"> = {},
+  ): Promise<RpcResult<"mcp.config.list">> {
+    return this.request("mcp.config.list", {}, options);
+  }
+
+  upsertMcpServer(
+    params: RpcParams<"mcp.config.upsert">,
+    options: Omit<RequestOptions, "idempotencyKey"> = {},
+  ): Promise<RpcResult<"mcp.config.upsert">> {
+    return this.request("mcp.config.upsert", params, options);
+  }
+
+  batchUpsertMcpServers(
+    params: RpcParams<"mcp.config.batch">,
+    options: Omit<RequestOptions, "idempotencyKey"> = {},
+  ): Promise<RpcResult<"mcp.config.batch">> {
+    return this.request("mcp.config.batch", params, options);
+  }
+
+  removeMcpServer(
+    params: RpcParams<"mcp.config.remove">,
+    options: Omit<RequestOptions, "idempotencyKey"> = {},
+  ): Promise<RpcResult<"mcp.config.remove">> {
+    return this.request("mcp.config.remove", params, options);
+  }
+
+  /** Connects to a candidate definition and lists its tools without saving it. */
+  probeMcpServer(
+    params: RpcParams<"mcp.config.probe">,
+    options: Omit<RequestOptions, "idempotencyKey"> = {},
+  ): Promise<RpcResult<"mcp.config.probe">> {
+    return this.request("mcp.config.probe", params, options);
+  }
+
   listProviders(
     params: RpcParams<"provider.list"> = {},
     options: Omit<RequestOptions, "idempotencyKey"> = {},
@@ -294,6 +393,13 @@ export class AxlClient {
     options: Omit<RequestOptions, "idempotencyKey"> = {},
   ): Promise<RpcResult<"provider.auth.logout">> {
     return this.request("provider.auth.logout", params, options);
+  }
+
+  respondToInteraction(
+    params: RpcParams<"session.interaction.respond">,
+    options: RequestOptions = {},
+  ): Promise<RpcResult<"session.interaction.respond">> {
+    return this.request("session.interaction.respond", params, options);
   }
 
   async readBlob(

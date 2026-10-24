@@ -22,7 +22,11 @@ import {
 
 import {
   AgentSession,
+  type CompactionSettings,
   CompactionUnavailableError,
+  JsonlEventLog,
+  type ExtensionHost,
+  type ExtensionSessionBinding,
   type KernelTool,
   type ModelPort,
   type ModelRetryOptions,
@@ -89,8 +93,10 @@ async function makeSession(
   options: {
     system?: string;
     retry?: ModelRetryOptions | false;
-    compaction?: { keepRecentTokens?: number; maxOutputTokens?: number };
+    compaction?: Partial<CompactionSettings>;
+    modelContextWindow?: number;
     onActivity?: (frame: SessionActivityFrame) => void;
+    extensionHost?: ExtensionHost;
   } = {},
 ): Promise<{ session: AgentSession; path: string; tools: ToolRegistry }> {
   const directory = await mkdtemp(join(tmpdir(), "axl-agent-session-"));
@@ -146,8 +152,54 @@ test("runs a plain turn and persists the canonical events", async (context) => {
 
   const reread = await session.log.read();
   const tree = SessionTree.fromEvents(sessionId, reread.events);
-  assert.equal(tree.size, 3); // session.created + 2
+  assert.equal(tree.size, 4); // session.created + context.resources + turn events
   assert.equal(reread.events[0]?.type, "session.created");
+  assert.equal(reread.events[1]?.type, "context.resources");
+  await session.dispose();
+});
+
+test("restores a missing prompt snapshot independently of context resources", async (context) => {
+  const directory = await mkdtemp(join(tmpdir(), "axl-agent-session-prompt-"));
+  context.after(() => rm(directory, { recursive: true, force: true }));
+  const path = join(directory, "session.jsonl");
+  const opened = await JsonlEventLog.open(path, sessionId);
+  const created = parseEvent({
+    version: EVENT_FORMAT_VERSION,
+    id: "00000000-0000-4000-8000-000000000201",
+    sessionId,
+    parentId: null,
+    timestamp: 1,
+    type: "session.created",
+    payload: { cwd: "/workspace" },
+  });
+  await opened.log.append(created);
+  await opened.log.append(
+    parseEvent({
+      version: EVENT_FORMAT_VERSION,
+      id: "00000000-0000-4000-8000-000000000202",
+      sessionId,
+      parentId: created.id,
+      timestamp: 2,
+      type: "context.resources",
+      payload: { resources: [] },
+    }),
+  );
+
+  const session = await AgentSession.open(path, sessionId, {
+    model: makePort([]),
+    tools: new ToolRegistry(),
+    cwd: "/workspace",
+    prompt: {
+      text: "System instructions",
+      sections: [{ name: "system", source: "built-in", content: "System instructions" }],
+    },
+  });
+  assert.deepEqual(
+    (await session.log.read()).events
+      .filter((item) => item.type === "prompt.section")
+      .map((item) => (item.type === "prompt.section" ? item.payload.content : "")),
+    ["System instructions"],
+  );
   await session.dispose();
 });
 
@@ -160,7 +212,7 @@ test("manual compaction replaces old model context without deleting history", as
     say("## Goal\nContinue the updated test"),
   ]);
   const { session, path } = await makeSession(context, port, new ToolRegistry(), {
-    compaction: { keepRecentTokens: 7, maxOutputTokens: 123 },
+    compaction: { keepRecentTokens: 7, reserveTokens: 154 },
   });
   const initial = (await session.log.read()).events;
   await assert.rejects(session.compact(), {
@@ -264,6 +316,167 @@ test("failed compaction leaves the original context active", async (context) => 
   await session.dispose();
 });
 
+test("proactively compacts before a prompt that would cross the reserved context boundary", async (context) => {
+  const port = makePort([
+    say("old answer"),
+    say("## Goal\nRetain the old turn"),
+    say("recent answer"),
+  ]);
+  const { session } = await makeSession(context, port, new ToolRegistry(), {
+    compaction: { enabled: true, reserveTokens: 8, keepRecentTokens: 1 },
+    modelContextWindow: 32,
+  });
+
+  await session.runTurn([{ type: "text", text: "old prompt" }]);
+  await session.runTurn([{ type: "text", text: "x".repeat(80) }]);
+
+  assert.equal(port.requests.length, 3);
+  assert.equal(port.requests[1]?.toolChoice, "none");
+  assert.equal(port.requests[1]?.cacheRetention, "none");
+  assert.match(JSON.stringify(port.requests[2]?.messages[0]), /Retain the old turn/);
+  const events = (await session.log.read()).events;
+  assert.equal(
+    events.find((event) => event.type === "compaction.started")?.payload.reason,
+    "threshold",
+  );
+  assert.equal(
+    events.some((event) => event.type === "context.compacted"),
+    true,
+  );
+});
+
+test("steering and follow-ups retain their boundary semantics during automatic compaction", async (context) => {
+  let releaseSummary = (): void => undefined;
+  let markSummaryStarted = (): void => undefined;
+  const summaryStarted = new Promise<void>((resolvePromise) => {
+    markSummaryStarted = resolvePromise;
+  });
+  const summaryGate = new Promise<void>((resolvePromise) => {
+    releaseSummary = resolvePromise;
+  });
+  const requests: ModelTurnRequest[] = [];
+  let calls = 0;
+  const port: ModelPort = {
+    stream(request) {
+      requests.push(request);
+      const call = ++calls;
+      return (async function* (): AsyncGenerator<ModelStreamEvent> {
+        if (call === 2) {
+          markSummaryStarted();
+          await summaryGate;
+          yield { type: "text_delta", text: "## Goal\nKeep context" };
+        } else {
+          yield { type: "text_delta", text: `answer ${call}` };
+        }
+        yield { type: "completed", stopReason: "stop", usage };
+      })();
+    },
+  };
+  const { session } = await makeSession(context, port, new ToolRegistry(), {
+    compaction: { enabled: true, reserveTokens: 8, keepRecentTokens: 1 },
+    modelContextWindow: 32,
+  });
+  await session.runTurn([{ type: "text", text: "old prompt" }]);
+
+  const running = session.runTurn([{ type: "text", text: "x".repeat(80) }]);
+  await summaryStarted;
+  session.steer([{ type: "text", text: "steer after compaction" }]);
+  session.followUp([{ type: "text", text: "follow after response" }]);
+  releaseSummary();
+  await running;
+
+  const lastUser = (request: ModelTurnRequest): string | undefined => {
+    const message = request.messages.findLast((item) => item.role === "user");
+    return message?.role === "user" && message.content[0]?.type === "text"
+      ? message.content[0].text
+      : undefined;
+  };
+  assert.equal(lastUser(requests[2] as ModelTurnRequest), "steer after compaction");
+  assert.equal(lastUser(requests[3] as ModelTurnRequest), "follow after response");
+});
+
+test("compacts between a tool result and the next model request", async (context) => {
+  const port = makePort([
+    callTool("call-1", { value: "large tool result" }),
+    say("## Goal\nContinue the tool turn"),
+    say("done"),
+  ]);
+  const registry = new ToolRegistry();
+  registry.register(echoTool().tool);
+  const { session } = await makeSession(context, port, registry, {
+    compaction: { enabled: true, reserveTokens: 5, keepRecentTokens: 1 },
+    modelContextWindow: 20,
+  });
+
+  await session.runTurn([{ type: "text", text: "use tool" }]);
+
+  assert.equal(port.requests.length, 3);
+  assert.equal(port.requests[1]?.toolChoice, "none");
+  assert.equal(
+    (await session.log.read()).events.some(
+      (event) => event.type === "compaction.started" && event.payload.reason === "threshold",
+    ),
+    true,
+  );
+});
+
+test("recovers one context overflow by compacting and retrying once", async (context) => {
+  const overflow: readonly ModelStreamEvent[] = [
+    {
+      type: "error",
+      code: "context_length_exceeded",
+      message: "too many tokens",
+      retryable: false,
+      category: "context_limit",
+      requestPhase: "before_dispatch",
+    },
+  ];
+  const port = makePort([
+    say("old answer"),
+    say("recent answer"),
+    overflow,
+    say("## Goal\nRecovered context"),
+    say("recovered"),
+  ]);
+  let requestContexts = 0;
+  const { session } = await makeSession(context, port, new ToolRegistry(), {
+    compaction: { enabled: true, reserveTokens: 8, keepRecentTokens: 1 },
+    extensionHost: {
+      activate: () => undefined,
+      dispose: () => undefined,
+      contributeContext: (input) => {
+        if (input.phase !== "request") return [];
+        requestContexts += 1;
+        return [
+          {
+            extensionId: "test",
+            source: "request",
+            content: "request context",
+            target: "system" as const,
+          },
+        ];
+      },
+    },
+  });
+  await session.runTurn([{ type: "text", text: "old prompt" }]);
+  await session.runTurn([{ type: "text", text: "recent prompt" }]);
+  requestContexts = 0;
+
+  const result = await session.runTurn([{ type: "text", text: "overflow prompt" }]);
+
+  assert.equal(result.stopReason, "stop");
+  assert.equal(port.requests.length, 5);
+  assert.equal(requestContexts, 1);
+  const events = (await session.log.read()).events;
+  assert.equal(
+    events.some(
+      (event) => event.type === "compaction.started" && event.payload.reason === "overflow",
+    ),
+    true,
+  );
+  assert.equal(events.filter((event) => event.type === "context.compacted").length, 1);
+});
+
 test("publishes ordered deltas and clears them after the canonical assistant event", async (context) => {
   const frames: SessionActivityFrame[] = [];
   const port = makePort([say("hello")]);
@@ -313,6 +526,127 @@ test("dispatches tool calls, pairs results, and feeds them back", async (context
   // The single operation owns every event of the turn.
   const operationIds = new Set(result.events.map((event) => event.operationId));
   assert.equal(operationIds.size, 1);
+});
+
+test("keeps activated capability instructions for the session and restores them on reopen", async (context) => {
+  const port = makePort([
+    [
+      {
+        type: "tool_call",
+        callId: "capability-1",
+        name: "capability_search",
+        input: { action: "activate", identities: ["skill:release"] },
+      },
+      { type: "completed", stopReason: "tool_use", usage },
+    ],
+    say("released"),
+    say("next"),
+  ]);
+  const registry = new ToolRegistry();
+  registry.registerCapability("skill:release", {
+    name: "release_tool",
+    description: "Release the project",
+    inputSchema: { type: "object" },
+    async execute() {
+      return { content: [{ type: "text", text: "released" }], isError: false };
+    },
+  });
+  registry.register({
+    name: "capability_search",
+    description: "Activate capabilities",
+    inputSchema: { type: "object" },
+    async execute() {
+      return {
+        content: [{ type: "text", text: '{"activated":["skill:release"]}' }],
+        isError: false,
+        sessionEffects: [
+          {
+            type: "capability.activated",
+            payload: {
+              capability: {
+                identity: "skill:release",
+                kind: "skill",
+                name: "release",
+                description: "Prepare releases",
+                path: "/workspace/.agents/skills/release/SKILL.md",
+                scope: "project",
+                provenance: "fixture",
+              },
+              content: "<skill>Release safely.</skill>",
+            },
+          },
+          {
+            type: "capability.activated",
+            payload: {
+              capability: {
+                identity: "skill:verify",
+                kind: "skill",
+                name: "verify",
+                description: "Verify releases",
+                path: "/workspace/.agents/skills/verify/SKILL.md",
+                scope: "project",
+                provenance: "fixture",
+              },
+              content: "<skill>Verify the result.</skill>",
+            },
+          },
+        ],
+      };
+    },
+  });
+  const { session, path } = await makeSession(context, port, registry, { system: "Base" });
+
+  const first = await session.runTurn([{ type: "text", text: "release" }]);
+  assert.deepEqual(
+    first.events.map((event) => event.type),
+    [
+      "user.message",
+      "assistant.message",
+      "tool.call",
+      "tool.result",
+      "capability.activated",
+      "tool.schema",
+      "capability.activated",
+      "assistant.message",
+    ],
+  );
+  assert.equal(
+    port.requests[1]?.system,
+    "Base\n\n<skill>Release safely.</skill>\n\n<skill>Verify the result.</skill>",
+  );
+  assert.deepEqual(
+    port.requests[0]?.tools.map((tool) => tool.name),
+    ["capability_search"],
+  );
+  assert.deepEqual(
+    port.requests[1]?.tools.map((tool) => tool.name),
+    ["capability_search", "release_tool"],
+  );
+
+  await session.runTurn([{ type: "text", text: "unrelated" }]);
+  const activeSystem =
+    "Base\n\n<skill>Release safely.</skill>\n\n<skill>Verify the result.</skill>";
+  assert.equal(port.requests[2]?.system, activeSystem);
+  assert.deepEqual(
+    port.requests[2]?.tools.map((tool) => tool.name),
+    ["capability_search", "release_tool"],
+  );
+
+  await session.dispose();
+  const resumedPort = makePort([say("resumed")]);
+  const resumed = await AgentSession.open(path, sessionId, {
+    model: resumedPort,
+    tools: registry,
+    cwd: "/workspace",
+    system: "Base",
+  });
+  await resumed.runTurn([{ type: "text", text: "after restart" }]);
+  assert.equal(resumedPort.requests[0]?.system, activeSystem);
+  assert.deepEqual(
+    resumedPort.requests[0]?.tools.map((tool) => tool.name),
+    ["capability_search", "release_tool"],
+  );
+  await resumed.dispose();
 });
 
 test("steering waits for the complete tool batch and follow-ups run afterward", async (context) => {
@@ -403,7 +737,56 @@ test("split-turn compaction keeps tool calls paired with their results", async (
     messagesFromLineage(events).map((message) => message.role),
     ["user", "assistant"],
   );
+  const splitPrompt = port.requests[2]?.messages[0];
+  assert.match(
+    splitPrompt?.role === "user" && splitPrompt.content[0]?.type === "text"
+      ? splitPrompt.content[0].text
+      : "",
+    /## Original Request/,
+  );
   await session.dispose();
+});
+
+test("repeated compaction preserves cumulative read and modified file lists", async (context) => {
+  const toolUse = (callId: string, name: string, path: string): readonly ModelStreamEvent[] => [
+    { type: "tool_call", callId, name, input: { path } },
+    { type: "completed", stopReason: "tool_use", usage },
+  ];
+  const port = makePort([
+    toolUse("read-1", "read", "README.md"),
+    say("read done"),
+    say("recent"),
+    say("first history summary"),
+    say("first turn-prefix summary"),
+    toolUse("edit-1", "edit", "src/main.ts"),
+    say("edit done"),
+    say("latest"),
+    say("second history summary"),
+    say("second turn-prefix summary"),
+  ]);
+  const registry = new ToolRegistry();
+  for (const name of ["read", "edit"]) {
+    registry.register({
+      name,
+      description: name,
+      inputSchema: { type: "object" },
+      execute: () => Promise.resolve({ content: [{ type: "text", text: "ok" }], isError: false }),
+    });
+  }
+  const { session } = await makeSession(context, port, registry, {
+    compaction: { keepRecentTokens: 1 },
+  });
+
+  await session.runTurn([{ type: "text", text: "read" }]);
+  await session.runTurn([{ type: "text", text: "checkpoint" }]);
+  const first = await session.compact();
+  assert.deepEqual(first.payload.readFiles, ["README.md"]);
+  await session.runTurn([{ type: "text", text: "edit" }]);
+  await session.runTurn([{ type: "text", text: "checkpoint again" }]);
+  const second = await session.compact();
+
+  assert.deepEqual(second.payload.readFiles, ["README.md"]);
+  assert.deepEqual(second.payload.modifiedFiles, ["src/main.ts"]);
 });
 
 test("an unregistered tool yields an error result, not a crash", async (context) => {
@@ -637,6 +1020,54 @@ test("interrupting during model output records an aborted turn cleanly", async (
   assert.equal(path.length > 0, true);
 });
 
+test("an aborted turn with no output leaves the live history identical to replay", async (context) => {
+  const controller = new AbortController();
+  const requests: ModelTurnRequest[] = [];
+  let turn = 0;
+  const port: ModelPort = {
+    stream: (request) => {
+      requests.push(request);
+      turn += 1;
+      const current = turn;
+      return (async function* () {
+        if (current === 1) {
+          controller.abort();
+          yield { type: "aborted" } as const;
+          return;
+        }
+        yield { type: "text_delta", text: "ok" } as const;
+        yield {
+          type: "completed",
+          stopReason: "stop",
+          usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 },
+        } as const;
+      })();
+    },
+  };
+  const { session } = await makeSession(context, port);
+  const aborted = await session.runTurn([{ type: "text", text: "first" }], controller.signal);
+  assert.equal(aborted.stopReason, "aborted");
+  const completed = await session.runTurn([{ type: "text", text: "second" }]);
+  assert.equal(completed.stopReason, "stop");
+
+  const second = requests[1];
+  assert.ok(second !== undefined);
+  for (const message of second.messages) {
+    assert.ok(
+      message.content.length > 0 ||
+        (message.role === "assistant" && (message.toolCalls?.length ?? 0) > 0),
+      `empty ${message.role} message reached the provider`,
+    );
+  }
+  const replayed = messagesFromLineage((await session.log.read()).events);
+  assert.deepEqual(
+    second.messages.map((message) => [message.role, message.content.length]),
+    replayed
+      .slice(0, second.messages.length)
+      .map((message) => [message.role, message.content.length]),
+  );
+});
+
 test("interrupting during a tool stops after the paired result", async (context) => {
   const controller = new AbortController();
   const registry = new ToolRegistry();
@@ -810,9 +1241,27 @@ test("reopening after daemon loss closes an unanswered tool call", async (contex
       message: "Approve?",
     },
   });
+  const compactionOperationId = parseOperationId("00000000-0000-4000-8000-000000000014");
+  const compaction = parseEvent({
+    version: EVENT_FORMAT_VERSION,
+    id: "00000000-0000-4000-8000-000000000015",
+    sessionId,
+    operationId: compactionOperationId,
+    parentId: interaction.id,
+    timestamp: 13,
+    type: "compaction.started",
+    payload: {
+      reason: "threshold",
+      estimatedInputTokens: 100,
+      contextWindow: 100,
+      reserveTokens: 10,
+      keepRecentTokens: 20,
+    },
+  });
   await session.log.append(assistant);
   await session.log.append(call);
   await session.log.append(interaction);
+  await session.log.append(compaction);
   await session.dispose();
 
   const port = makePort([say("continued")]);
@@ -830,6 +1279,13 @@ test("reopening after daemon loss closes an unanswered tool call", async (contex
   assert.ok(resolvedInteraction);
   if (resolvedInteraction.type === "interaction.resolved") {
     assert.equal(resolvedInteraction.payload.action, "cancel");
+  }
+  const failedCompaction = recoveredEvents.find(
+    (event) => event.type === "compaction.failed" && event.operationId === compactionOperationId,
+  );
+  assert.ok(failedCompaction);
+  if (failedCompaction.type === "compaction.failed") {
+    assert.equal(failedCompaction.payload.code, "daemon_restart");
   }
   const recovered = recoveredEvents.find(
     (event) => event.type === "tool.result" && event.payload.callId === "interrupted-call",
@@ -939,6 +1395,78 @@ test("the extension host seam activates and disposes with the session", async (c
   });
   await session.dispose();
   assert.deepEqual(lifecycle, ["activate", "dispose"]);
+});
+
+test("a failed session open disposes its extension host without appending events", async (context) => {
+  const lifecycle: string[] = [];
+  const directory = await mkdtemp(join(tmpdir(), "axl-agent-session-"));
+  const path = join(directory, "session.jsonl");
+  context.after(() => rm(directory, { recursive: true, force: true }));
+  await assert.rejects(
+    AgentSession.open(path, sessionId, {
+      model: makePort([]),
+      tools: new ToolRegistry(),
+      cwd: "/workspace",
+      extensionHost: {
+        activate: () => {
+          lifecycle.push("activate");
+          throw new Error("activation failed");
+        },
+        dispose: () => {
+          lifecycle.push("dispose");
+        },
+      },
+    }),
+    /activation failed/,
+  );
+  assert.deepEqual(lifecycle, ["activate", "dispose"]);
+  assert.deepEqual((await JsonlEventLog.open(path, sessionId)).events, []);
+});
+
+test("rebuilds namespaced extension state from canonical events", async (context) => {
+  const directory = await mkdtemp(join(tmpdir(), "axl-agent-session-state-"));
+  context.after(() => rm(directory, { recursive: true, force: true }));
+  const path = join(directory, "session.jsonl");
+  let binding: ExtensionSessionBinding | undefined;
+  const currentBinding = (): ExtensionSessionBinding => {
+    if (binding === undefined) throw new Error("session was not bound");
+    return binding;
+  };
+  const host = {
+    bindSession(value: ExtensionSessionBinding) {
+      binding = value;
+    },
+    activate: () => undefined,
+    dispose: () => undefined,
+  };
+  const session = await AgentSession.open(path, sessionId, {
+    model: makePort([]),
+    tools: new ToolRegistry(),
+    cwd: "/workspace",
+    extensionHost: host,
+  });
+  await currentBinding().setState("example", "count", 2);
+  assert.equal(currentBinding().getState("example", "count"), 2);
+  const stateEvent = (await session.log.read()).events.findLast(
+    (event) => event.type === "extension.state",
+  );
+  assert.ok(stateEvent);
+  await currentBinding().setEntryLabel("example", stateEvent.id, "important");
+  assert.equal(currentBinding().getEntryLabel("example", stateEvent.id), "important");
+  await session.dispose();
+
+  binding = undefined;
+  const reopened = await AgentSession.open(path, sessionId, {
+    model: makePort([]),
+    tools: new ToolRegistry(),
+    cwd: "/workspace",
+    extensionHost: host,
+  });
+  assert.equal(currentBinding().getState("example", "count"), 2);
+  assert.equal(currentBinding().getEntryLabel("example", stateEvent.id), "important");
+  await currentBinding().setState("example", "count", null);
+  assert.equal(currentBinding().getState("example", "count"), undefined);
+  await reopened.dispose();
 });
 
 test("records effective request configuration before each model dispatch", async (context) => {

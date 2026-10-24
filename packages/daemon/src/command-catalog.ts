@@ -1,9 +1,110 @@
 // SPDX-FileCopyrightText: 2026 Hari Srinivasan
+// SPDX-FileCopyrightText: 2026 Shaan Narendran
 // SPDX-License-Identifier: Apache-2.0
 
-import type { CapabilityId, CommandDescriptor, CommandListResult, SessionId } from "@axl/protocol";
+import {
+  type CapabilitySource,
+  makeCompactContextTool,
+  makeReloadContextTool,
+  ToolCapabilityService,
+  type ToolRegistry,
+} from "@axl/kernel";
+import type {
+  CapabilityId,
+  CapabilityRecord,
+  CommandDescriptor,
+  CommandListResult,
+  JsonObject,
+  McpConfigListResult,
+  McpConfigMutationResult,
+  McpServerDefinition,
+  SessionId,
+} from "@axl/protocol";
 
-const BUILT_INS: readonly Omit<CommandDescriptor, "availability">[] = [
+interface ModelToolContext {
+  readonly tools: ToolRegistry;
+  readonly compact: (instructions?: string) => Promise<unknown>;
+  readonly reload: () => Promise<unknown>;
+  readonly mcp?: {
+    list(): Promise<McpConfigListResult>;
+    upsert(name: string, definition: McpServerDefinition): Promise<McpConfigMutationResult>;
+    remove(name: string): Promise<McpConfigMutationResult>;
+  };
+}
+
+function makeConfigureMcpTool(context: ModelToolContext) {
+  return {
+    name: "configure_mcp",
+    description:
+      "List, add, update, or remove MCP servers in ~/.axl/mcp.json. Use either {url, headers?, oauth?, roots?} for Streamable HTTP or {command, args?, cwd?, env?, roots?} for stdio. Header and env values name host environment variables rather than containing secrets. Listing reports each server's discovery status and tool count. Changes reload after this response.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["list", "upsert", "remove"] },
+        name: { type: "string", minLength: 1, maxLength: 128 },
+        definition: { type: "object", additionalProperties: true },
+      },
+      required: ["action"],
+      additionalProperties: false,
+    },
+    async execute(input: JsonObject, signal: AbortSignal) {
+      if (context.mcp === undefined) throw new Error("MCP configuration is unavailable");
+      signal.throwIfAborted();
+      let result: McpConfigListResult | McpConfigMutationResult;
+      if (input.action === "list") {
+        result = await context.mcp.list();
+      } else if (input.action === "upsert") {
+        if (
+          typeof input.name !== "string" ||
+          typeof input.definition !== "object" ||
+          input.definition === null ||
+          Array.isArray(input.definition)
+        ) {
+          throw new TypeError("configure_mcp upsert requires name and definition");
+        }
+        result = await context.mcp.upsert(
+          input.name,
+          input.definition as unknown as McpServerDefinition,
+        );
+        await context.reload();
+      } else if (input.action === "remove") {
+        if (typeof input.name !== "string") {
+          throw new TypeError("configure_mcp remove requires name");
+        }
+        result = await context.mcp.remove(input.name);
+        await context.reload();
+      } else {
+        throw new TypeError("configure_mcp action must be list, upsert, or remove");
+      }
+      signal.throwIfAborted();
+      const compact = {
+        path: result.path,
+        ...("changed" in result ? { changed: result.changed } : {}),
+        servers: result.servers.map((server) => ({
+          name: server.name,
+          definition: server.definition,
+          status: server.status,
+          toolCount: server.tools.length,
+          ...(server.error === undefined ? {} : { error: server.error }),
+        })),
+      };
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(compact) }],
+        isError: false,
+      };
+    },
+  };
+}
+
+interface BuiltInCommand extends Omit<CommandDescriptor, "availability"> {
+  readonly modelTool?: {
+    readonly identity: string;
+    readonly aliases: readonly string[];
+    readonly create: (context: ModelToolContext) => ReturnType<typeof makeCompactContextTool>;
+  };
+}
+
+const BUILT_INS: readonly BuiltInCommand[] = [
   {
     id: "core.model",
     name: "model",
@@ -59,6 +160,25 @@ const BUILT_INS: readonly Omit<CommandDescriptor, "availability">[] = [
     requiredCapabilities: ["provider.auth.logout"],
   },
   {
+    id: "core.mcp",
+    name: "mcp",
+    aliases: [],
+    description: "configure global MCP servers",
+    context: "global",
+    argument: { required: false, hint: "server" },
+    requiredCapabilities: [
+      "mcp.config.list",
+      "mcp.config.upsert",
+      "mcp.config.remove",
+      "mcp.config.probe",
+    ],
+    modelTool: {
+      identity: "tool:configure-mcp",
+      aliases: ["configure mcp", "add mcp server", "remove mcp server"],
+      create: makeConfigureMcpTool,
+    },
+  },
+  {
     id: "core.reload",
     name: "reload",
     aliases: [],
@@ -66,6 +186,11 @@ const BUILT_INS: readonly Omit<CommandDescriptor, "availability">[] = [
     context: "session",
     argument: { required: false },
     requiredCapabilities: ["session.reload"],
+    modelTool: {
+      identity: "tool:reload-context",
+      aliases: ["reload context", "reload instructions"],
+      create: ({ reload }) => makeReloadContextTool(reload),
+    },
   },
   {
     id: "core.compact",
@@ -75,6 +200,11 @@ const BUILT_INS: readonly Omit<CommandDescriptor, "availability">[] = [
     context: "session",
     argument: { required: false, hint: "instructions" },
     requiredCapabilities: ["session.compact"],
+    modelTool: {
+      identity: "tool:compact-context",
+      aliases: ["compact context", "context compaction"],
+      create: ({ compact }) => makeCompactContextTool(compact),
+    },
   },
   {
     id: "core.request",
@@ -196,10 +326,10 @@ export function commandCatalog(
   sessionId?: SessionId,
 ): CommandListResult {
   return {
-    generation: "builtin-3",
+    generation: "builtin-5",
     commands: BUILT_INS.filter((command) =>
       command.requiredCapabilities.every((capability) => capabilities.has(capability)),
-    ).map((command) => ({
+    ).map(({ modelTool: _modelTool, ...command }) => ({
       ...command,
       availability:
         command.context === "session" && sessionId === undefined
@@ -207,4 +337,41 @@ export function commandCatalog(
           : { state: "available" as const },
     })),
   };
+}
+
+/** Installs the model-callable subset from the same registry that owns user commands. */
+export function installDaemonCommandCapabilities(context: ModelToolContext): {
+  readonly source: CapabilitySource;
+  readonly grantedAuthorities: ReadonlySet<string>;
+} {
+  const definitions = BUILT_INS.filter(
+    (command) =>
+      command.modelTool !== undefined && (command.name !== "mcp" || context.mcp !== undefined),
+  );
+  const grantedAuthorities = new Set(
+    definitions.flatMap((command) => command.requiredCapabilities),
+  );
+  const records: CapabilityRecord[] = [];
+  for (const definition of definitions) {
+    const modelTool = definition.modelTool;
+    if (modelTool === undefined) continue;
+    const tool = modelTool.create(context);
+    context.tools.registerCapability(modelTool.identity, tool);
+    records.push({
+      identity: modelTool.identity,
+      kind: "tool",
+      name: definition.name,
+      description: tool.description,
+      aliases: modelTool.aliases,
+      path: `builtin:${tool.name}`,
+      scope: "global",
+      provenance: definition.id,
+      enabled: true,
+      trust: "trusted",
+      available: true,
+      requiredAuthority: definition.requiredCapabilities,
+    });
+  }
+  const service = new ToolCapabilityService(records, grantedAuthorities);
+  return { source: { records, service }, grantedAuthorities };
 }

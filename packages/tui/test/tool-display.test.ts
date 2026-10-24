@@ -6,7 +6,6 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { TerminalExtensionHost } from "@axl/extension-api";
-import { mcpTerminalExtension } from "@axl/extension-mcp";
 import { skillTerminalExtension } from "@axl/extension-skills";
 
 import {
@@ -186,46 +185,33 @@ test("focus mode hides routine success while retaining failures and edits", () =
   assert.match(failed.join("\n"), /not found/);
 });
 
-test("first-party MCP and skill views use public renderer registrations", async () => {
-  const host = new TerminalExtensionHost([mcpTerminalExtension, skillTerminalExtension]);
+test("capability views use public renderer registrations", async () => {
+  const host = new TerminalExtensionHost([skillTerminalExtension]);
   await host.activate();
-  const mcpRenderer = host.toolRenderer("mcp");
-  const skillRenderer = host.toolRenderer("skill");
-  assert.ok(mcpRenderer);
-  assert.ok(skillRenderer);
-  const mcp = renderToolTransaction({
-    callId: "mcp-call",
-    name: "mcp",
-    args: { server: "docs", action: "call_tool", name: "search" },
+  const capabilityRenderer = host.toolRenderer("capability_search");
+  assert.ok(capabilityRenderer);
+  const capability = renderToolTransaction({
+    callId: "capability-call",
+    name: "capability_search",
+    args: { action: "activate", identities: ["skill:review"] },
     status: "running",
     width: 80,
     mode: "compact",
     palette: PLAIN_PALETTE,
-    renderer: mcpRenderer,
+    renderer: capabilityRenderer,
   });
-  const skill = renderToolTransaction({
-    callId: "skill-call",
-    name: "skill",
-    args: { action: "load", name: "review" },
-    status: "running",
-    width: 80,
-    mode: "compact",
-    palette: PLAIN_PALETTE,
-    renderer: skillRenderer,
-  });
-  assert.match(mcp.join("\n"), /MCP {2}docs · search/);
-  assert.match(skill.join("\n"), /SKILL {2}load · review/);
-  assert.equal(skill.join("\n").includes("TOOL SKILL"), false);
+  assert.match(capability.join("\n"), /CAPABILITY {2}activate · skill:review/);
+  assert.equal(capability.join("\n").includes("TOOL CAPABILITY_SEARCH"), false);
   const settledSkill = renderToolTransaction({
-    callId: "skill-call",
-    name: "skill",
-    args: { action: "load", name: "review" },
+    callId: "capability-call",
+    name: "capability_search",
+    args: { action: "activate", identities: ["skill:review"] },
     result: "a very long skill body that should stay out of compact mode",
     status: "succeeded",
     width: 80,
     mode: "compact",
     palette: PLAIN_PALETTE,
-    renderer: skillRenderer,
+    renderer: capabilityRenderer,
   });
   assert.equal(settledSkill.join("\n").includes("a very long skill body"), false);
   await host.dispose();

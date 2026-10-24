@@ -1,17 +1,30 @@
 // SPDX-FileCopyrightText: 2026 Hari Srinivasan
+// SPDX-FileCopyrightText: 2026 Shaan Narendran
 // SPDX-License-Identifier: Apache-2.0
 
-import { readFile } from "node:fs/promises";
-import { isAbsolute, join, resolve } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { chmod, lstat, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { dirname, isAbsolute, join, resolve } from "node:path";
+
+import {
+  MCP_CONFIG_LIMITS,
+  type McpConfigListResult,
+  type McpConfigMutationResult,
+  type McpServerDefinition,
+  type McpServerEntry,
+  parseMcpServerDefinition,
+  parseMcpServerName,
+} from "@axl/protocol";
 
 const SERVER_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
+const MAX_CONFIG_BYTES = 1024 * 1024;
 
 export interface McpStdioServerConfig {
   readonly transport: "stdio";
   readonly command: string;
   readonly args: readonly string[];
   readonly cwd?: string;
-  /** Child environment variable to parent environment variable name. */
+  /** Child variable to a parent variable name or a `${VAR}` template. */
   readonly env: Readonly<Record<string, string>>;
   readonly roots: readonly string[];
   readonly enabled: boolean;
@@ -27,7 +40,7 @@ export interface McpHttpOAuthConfig {
 export interface McpHttpServerConfig {
   readonly transport: "http";
   readonly url: string;
-  /** HTTP header to parent environment variable name. */
+  /** HTTP header to a parent variable name or a `${VAR}` template such as `Bearer ${TOKEN}`. */
   readonly headers: Readonly<Record<string, string>>;
   readonly oauth?: McpHttpOAuthConfig;
   readonly roots: readonly string[];
@@ -37,10 +50,49 @@ export interface McpHttpServerConfig {
 
 export type McpServerConfig = McpStdioServerConfig | McpHttpServerConfig;
 
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (typeof value === "object" && value !== null) {
+    return `{${Object.entries(value)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+export function mcpConfigurationFingerprint(config: McpServerConfig): string {
+  return createHash("sha256").update(canonicalJson(config)).digest("hex");
+}
+
+/** Fingerprint of the definition as written, independent of the resolving working directory. */
+export function mcpDefinitionFingerprint(definition: McpServerDefinition): string {
+  return createHash("sha256").update(canonicalJson(definition)).digest("hex");
+}
+
 export interface NamedMcpServerConfig {
   readonly name: string;
   readonly config: McpServerConfig;
   readonly source: string;
+  /** The validated definition exactly as configured. */
+  readonly definition: McpServerDefinition;
+}
+
+/** Discovery state recorded by sessions and projected to clients through the config store. */
+export interface McpDiscoveryStateReader {
+  read(): Promise<{
+    readonly discovered: readonly {
+      readonly server: string;
+      readonly definitionFingerprint: string;
+      readonly discoveredAt: number;
+      readonly tools: readonly { readonly name: string; readonly description: string }[];
+    }[];
+    readonly failed: readonly {
+      readonly server: string;
+      readonly definitionFingerprint: string;
+      readonly error: string;
+    }[];
+  }>;
 }
 
 export interface LoadMcpConfigOptions {
@@ -91,6 +143,52 @@ function stringMap(value: unknown, path: string): Readonly<Record<string, string
   return result;
 }
 
+/** Bare references must be conventional UPPER_CASE names so a pasted token is never mistaken for one. */
+const ENVIRONMENT_NAME = /^[A-Z_][A-Z0-9_]*$/;
+const PLACEHOLDER = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
+
+/**
+ * Names of the environment variables a header or env value reads from. A bare
+ * name means "the whole value comes from this variable"; otherwise the value is
+ * literal text with `${VAR}` placeholders. Literal text without a placeholder is
+ * rejected so secrets can never be written into the configuration file.
+ */
+export function mcpSecretReferences(value: string): readonly string[] {
+  if (ENVIRONMENT_NAME.test(value)) return [value];
+  return [...value.matchAll(PLACEHOLDER)].map((match) => match[1] as string);
+}
+
+/** Resolves a header or env value from the environment. Throws when a referenced variable is unset. */
+export function resolveMcpSecretValue(
+  value: string,
+  env: Readonly<Record<string, string | undefined>>,
+  describe: () => string,
+): string {
+  if (ENVIRONMENT_NAME.test(value)) {
+    const resolved = env[value];
+    if (resolved === undefined) throw new Error(`${describe()}: ${value} is not set`);
+    return resolved;
+  }
+  return value.replace(PLACEHOLDER, (_match, name: string) => {
+    const resolved = env[name];
+    if (resolved === undefined) throw new Error(`${describe()}: ${name} is not set`);
+    return resolved;
+  });
+}
+
+function secretMap(value: unknown, path: string): Readonly<Record<string, string>> {
+  const map = stringMap(value, path);
+  for (const [key, item] of Object.entries(map)) {
+    if (mcpSecretReferences(item).length === 0) {
+      throw new McpConfigError(
+        `${path}.${key}`,
+        "must be an UPPER_CASE environment variable name (TOKEN) or use ${VAR} placeholders (Bearer ${TOKEN}); literal values are never stored",
+      );
+    }
+  }
+  return map;
+}
+
 function timeout(value: unknown, path: string): number {
   if (value === undefined) return 60_000;
   if (!Number.isSafeInteger(value) || (value as number) < 1) {
@@ -131,18 +229,14 @@ function oauth(value: unknown, path: string): McpHttpOAuthConfig {
 
 function serverConfig(value: unknown, path: string, cwd: string): McpServerConfig {
   const input = object(value, path);
-  const transport = string(input.transport, `${path}.transport`);
+  const hasUrl = input.url !== undefined;
+  const hasCommand = input.command !== undefined;
+  if (hasUrl === hasCommand) {
+    throw new McpConfigError(path, "must contain exactly one of url or command");
+  }
+  const transport = hasUrl ? "http" : "stdio";
   if (transport === "stdio") {
-    exact(input, path, [
-      "transport",
-      "command",
-      "args",
-      "cwd",
-      "env",
-      "roots",
-      "enabled",
-      "requestTimeoutMs",
-    ]);
+    exact(input, path, ["command", "args", "cwd", "env", "roots", "enabled", "requestTimeoutMs"]);
     const configuredCwd = input.cwd === undefined ? undefined : string(input.cwd, `${path}.cwd`);
     return {
       transport,
@@ -151,7 +245,7 @@ function serverConfig(value: unknown, path: string, cwd: string): McpServerConfi
       ...(configuredCwd === undefined
         ? {}
         : { cwd: isAbsolute(configuredCwd) ? configuredCwd : resolve(cwd, configuredCwd) }),
-      env: stringMap(input.env, `${path}.env`),
+      env: secretMap(input.env, `${path}.env`),
       roots: stringArray(input.roots, `${path}.roots`).map((root) =>
         isAbsolute(root) ? resolve(root) : resolve(cwd, root),
       ),
@@ -159,16 +253,8 @@ function serverConfig(value: unknown, path: string, cwd: string): McpServerConfi
       requestTimeoutMs: timeout(input.requestTimeoutMs, `${path}.requestTimeoutMs`),
     };
   }
-  if (transport === "http") {
-    exact(input, path, [
-      "transport",
-      "url",
-      "headers",
-      "oauth",
-      "roots",
-      "enabled",
-      "requestTimeoutMs",
-    ]);
+  {
+    exact(input, path, ["url", "headers", "oauth", "roots", "enabled", "requestTimeoutMs"]);
     const url = httpUrl(input.url, `${path}.url`);
     if (
       url.protocol !== "https:" &&
@@ -183,9 +269,9 @@ function serverConfig(value: unknown, path: string, cwd: string): McpServerConfi
       throw new McpConfigError(`${path}.url`, "must not contain credentials or a fragment");
     }
     return {
-      transport,
+      transport: "http",
       url: url.href,
-      headers: stringMap(input.headers, `${path}.headers`),
+      headers: secretMap(input.headers, `${path}.headers`),
       ...(input.oauth === undefined ? {} : { oauth: oauth(input.oauth, `${path}.oauth`) }),
       roots: stringArray(input.roots, `${path}.roots`).map((root) =>
         isAbsolute(root) ? resolve(root) : resolve(cwd, root),
@@ -194,7 +280,6 @@ function serverConfig(value: unknown, path: string, cwd: string): McpServerConfi
       requestTimeoutMs: timeout(input.requestTimeoutMs, `${path}.requestTimeoutMs`),
     };
   }
-  throw new McpConfigError(`${path}.transport`, "must be stdio or http");
 }
 
 async function readConfig(path: string, cwd: string): Promise<NamedMcpServerConfig[]> {
@@ -212,15 +297,16 @@ async function readConfig(path: string, cwd: string): Promise<NamedMcpServerConf
     throw new McpConfigError(path, `invalid JSON: ${String(cause)}`);
   }
   const root = object(parsed, path);
-  exact(root, path, ["servers"]);
-  const servers = object(root.servers, `${path}.servers`);
+  exact(root, path, ["mcpServers"]);
+  const servers = object(root.mcpServers, `${path}.mcpServers`);
   const result: NamedMcpServerConfig[] = [];
   for (const [name, value] of Object.entries(servers)) {
     if (!SERVER_NAME.test(name)) {
-      throw new McpConfigError(`${path}.servers.${name}`, "server name is invalid");
+      throw new McpConfigError(`${path}.mcpServers.${name}`, "server name is invalid");
     }
-    const config = serverConfig(value, `${path}.servers.${name}`, cwd);
-    result.push({ name, config, source: path });
+    const config = serverConfig(value, `${path}.mcpServers.${name}`, cwd);
+    const definition = parseMcpServerDefinition(value, `${path}.mcpServers.${name}`);
+    result.push({ name, config, source: path, definition });
   }
   return result;
 }
@@ -231,28 +317,216 @@ export function mcpSecretValues(
 ): readonly string[] {
   const names = new Set<string>();
   for (const server of servers) {
-    if (server.config.transport === "stdio") {
-      for (const source of Object.values(server.config.env)) names.add(source);
-    } else {
-      for (const source of Object.values(server.config.headers)) names.add(source);
-      if (server.config.oauth?.clientSecretEnv) names.add(server.config.oauth.clientSecretEnv);
+    const values =
+      server.config.transport === "stdio"
+        ? Object.values(server.config.env)
+        : Object.values(server.config.headers);
+    for (const value of values) for (const name of mcpSecretReferences(value)) names.add(name);
+    if (server.config.transport === "http" && server.config.oauth?.clientSecretEnv) {
+      names.add(server.config.oauth.clientSecretEnv);
     }
   }
   return [...new Set([...names].flatMap((name) => (env[name] ? [env[name] as string] : [])))];
 }
 
-/** Global configuration is loaded first; project entries replace matching server names. */
+function definitions(value: unknown, path: string): Record<string, McpServerDefinition> {
+  const root = object(value, path);
+  exact(root, path, ["mcpServers"]);
+  const servers = object(root.mcpServers, `${path}.mcpServers`);
+  if (Object.keys(servers).length > 256) throw new McpConfigError(path, "has too many servers");
+  return Object.fromEntries(
+    Object.entries(servers).map(([name, value]) => {
+      parseMcpServerName(name, `${path}.mcpServers.${name}`);
+      return [name, parseMcpServerDefinition(value, `${path}.mcpServers.${name}`)];
+    }),
+  );
+}
+
+async function readDefinitions(
+  path: string,
+  cwd: string,
+): Promise<Record<string, McpServerDefinition>> {
+  try {
+    const stats = await lstat(path);
+    if (stats.isSymbolicLink() || !stats.isFile()) {
+      throw new McpConfigError(path, "must be a regular file, not a symlink");
+    }
+    if (stats.size > MAX_CONFIG_BYTES) {
+      throw new McpConfigError(path, `must not exceed ${MAX_CONFIG_BYTES} bytes`);
+    }
+    const configured = definitions(JSON.parse(await readFile(path, "utf8")) as unknown, path);
+    for (const [name, definition] of Object.entries(configured)) {
+      serverConfig(definition, `${path}.mcpServers.${name}`, cwd);
+    }
+    return configured;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+    if (error instanceof SyntaxError)
+      throw new McpConfigError(path, `invalid JSON: ${error.message}`);
+    throw error;
+  }
+}
+
+/** Validates one definition the way the session loader does and resolves it against `cwd`. */
+export function resolveMcpServerConfig(
+  name: string,
+  definition: McpServerDefinition,
+  cwd: string,
+  source = "probe",
+): NamedMcpServerConfig {
+  parseMcpServerName(name, "name");
+  const parsed = parseMcpServerDefinition(definition, "definition");
+  return {
+    name,
+    config: serverConfig(parsed, `mcpServers.${name}`, cwd),
+    source,
+    definition: parsed,
+  };
+}
+
+function truncate(text: string, limit: number): string {
+  return text.length <= limit ? text : `${text.slice(0, Math.max(0, limit - 1))}…`;
+}
+
+/** Owns validated user MCP configuration outside model command sandboxes. */
+export class McpConfigStore {
+  readonly path: string;
+  private readonly cwd: string;
+  private readonly discovery: McpDiscoveryStateReader | undefined;
+  private pending = Promise.resolve();
+
+  constructor(globalDirectory: string, cwd: string, discovery?: McpDiscoveryStateReader) {
+    this.path = join(globalDirectory, "mcp.json");
+    this.cwd = cwd;
+    this.discovery = discovery;
+  }
+
+  async list(): Promise<McpConfigListResult> {
+    const configured = await readDefinitions(this.path, this.cwd);
+    const state = (await this.discovery?.read()) ?? { discovered: [], failed: [] };
+    return {
+      path: this.path,
+      servers: Object.entries(configured)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([name, definition]): McpServerEntry => {
+          if (definition.enabled === false)
+            return { name, definition, status: "disabled", tools: [] };
+          const fingerprint = mcpDefinitionFingerprint(definition);
+          const discovered = state.discovered.find(
+            (entry) => entry.server === name && entry.definitionFingerprint === fingerprint,
+          );
+          if (discovered !== undefined) {
+            return {
+              name,
+              definition,
+              status: "discovered",
+              discoveredAt: discovered.discoveredAt,
+              tools: discovered.tools.map((tool) => ({
+                name: tool.name,
+                description: truncate(tool.description, MCP_CONFIG_LIMITS.toolDescription),
+              })),
+            };
+          }
+          const failed = state.failed.find(
+            (entry) => entry.server === name && entry.definitionFingerprint === fingerprint,
+          );
+          if (failed !== undefined) {
+            return {
+              name,
+              definition,
+              status: "failed",
+              tools: [],
+              error: truncate(failed.error, MCP_CONFIG_LIMITS.error),
+            };
+          }
+          return { name, definition, status: "pending", tools: [] };
+        }),
+    };
+  }
+
+  upsert(name: string, definition: McpServerDefinition): Promise<McpConfigMutationResult> {
+    return this.upsertMany([{ name, definition }]);
+  }
+
+  upsertMany(
+    servers: readonly { readonly name: string; readonly definition: McpServerDefinition }[],
+  ): Promise<McpConfigMutationResult> {
+    return this.mutate(async (configured) => {
+      const parsed = servers.map(({ name, definition }) => {
+        parseMcpServerName(name, "name");
+        const value = parseMcpServerDefinition(definition, "definition");
+        serverConfig(value, `mcpServers.${name}`, this.cwd);
+        return { name, definition: value };
+      });
+      let changed = false;
+      for (const server of parsed) {
+        changed ||= JSON.stringify(configured[server.name]) !== JSON.stringify(server.definition);
+        configured[server.name] = server.definition;
+      }
+      if (Object.keys(configured).length > MCP_CONFIG_LIMITS.servers) {
+        throw new McpConfigError(
+          "mcpServers",
+          `must contain at most ${MCP_CONFIG_LIMITS.servers} servers`,
+        );
+      }
+      return changed;
+    });
+  }
+
+  remove(name: string): Promise<McpConfigMutationResult> {
+    return this.mutate(async (configured) => {
+      parseMcpServerName(name, "name");
+      if (!(name in configured)) return false;
+      delete configured[name];
+      return true;
+    });
+  }
+
+  private mutate(
+    update: (configured: Record<string, McpServerDefinition>) => Promise<boolean>,
+  ): Promise<McpConfigMutationResult> {
+    const operation = this.pending.then(async () => {
+      const configured = await readDefinitions(this.path, this.cwd);
+      const changed = await update(configured);
+      if (changed) await this.write(configured);
+      return { ...(await this.list()), changed };
+    });
+    this.pending = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return operation;
+  }
+
+  private async write(configured: Record<string, McpServerDefinition>): Promise<void> {
+    await mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
+    const temporary = `${this.path}.${process.pid}.${randomUUID()}.tmp`;
+    const content = `${JSON.stringify({ mcpServers: configured }, null, 2)}\n`;
+    if (Buffer.byteLength(content) > MAX_CONFIG_BYTES) {
+      throw new McpConfigError(this.path, `must not exceed ${MAX_CONFIG_BYTES} bytes`);
+    }
+    try {
+      await writeFile(temporary, content, {
+        encoding: "utf8",
+        mode: 0o600,
+        flag: "wx",
+      });
+      await rename(temporary, this.path);
+      await chmod(this.path, 0o600);
+    } finally {
+      await unlink(temporary).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== "ENOENT") throw error;
+      });
+    }
+  }
+}
+
+/** Loads only the user-owned global MCP configuration. */
 export async function loadMcpConfig(
   options: LoadMcpConfigOptions,
 ): Promise<readonly NamedMcpServerConfig[]> {
-  const merged = new Map<string, NamedMcpServerConfig>();
-  for (const path of [
-    ...(options.globalDirectory === undefined ? [] : [join(options.globalDirectory, "mcp.json")]),
-    join(resolve(options.cwd), ".axl", "mcp.json"),
-  ]) {
-    for (const server of await readConfig(path, options.cwd)) merged.set(server.name, server);
-  }
-  return [...merged.values()]
+  if (options.globalDirectory === undefined) return [];
+  return (await readConfig(join(options.globalDirectory, "mcp.json"), options.cwd))
     .filter((server) => server.config.enabled)
     .sort((left, right) => left.name.localeCompare(right.name));
 }

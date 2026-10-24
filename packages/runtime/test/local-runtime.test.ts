@@ -2,19 +2,21 @@
 // SPDX-FileCopyrightText: 2026 Lokesh
 // SPDX-FileCopyrightText: 2026 Srihari
 // SPDX-FileCopyrightText: 2026 VishnuM449
+// SPDX-FileCopyrightText: 2026 Shaan Narendran
 // SPDX-License-Identifier: Apache-2.0
 
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { FileCredentialStore, getStaticModelCatalog } from "@axl/ai";
 import { AxlDaemon } from "@axl/daemon";
 import { type ModelPort, ToolRegistry } from "@axl/kernel";
-import type { ModelStreamEvent } from "@axl/protocol";
+import type { CanonicalEvent, ModelStreamEvent } from "@axl/protocol";
 import { AxlClientError } from "@axl/sdk";
 import { connectUnixClient } from "@axl/sdk/unix";
 
@@ -123,6 +125,7 @@ test("provider output cannot persist rotating request credentials", async (conte
     defaults: { providerId: "custom", modelId: "echo-model", thinkingLevel: "off" },
     store: new FileCredentialStore(join(axlHome, "credentials.json")),
     unsafe: true,
+    modelsDevAutoRefresh: { enabled: false },
   });
   context.after(() => daemon.stop());
   const client = await connectUnixClient(socketPath);
@@ -214,18 +217,41 @@ test("discovers native and unsafe histories with explicit placement labels", asy
 });
 
 test("assembles an authoritative local runtime without a presentation client", async (context) => {
-  const root = await mkdtemp(join(tmpdir(), "axl-runtime-"));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "axl-runtime-")));
   context.after(() => rm(root, { recursive: true, force: true }));
   const axlHome = join(root, ".axl");
   const workspace = join(root, "workspace");
   const stateDirectory = join(axlHome, "unsafe");
   const socketPath = join(stateDirectory, "axl.sock");
-  await mkdir(workspace, { recursive: true });
+  await mkdir(join(workspace, ".axl", "skills", "ignored"), { recursive: true });
+  await writeFile(join(workspace, "AGENTS.md"), "Use the repository instructions.\n");
+  await writeFile(
+    join(workspace, ".axl", "skills", "ignored", "SKILL.md"),
+    "---\nname: ignored\ndescription: Must not enter the stable prompt.\n---\nIgnored.\n",
+  );
 
   const store = new FileCredentialStore(join(axlHome, "credentials.json"));
   const customSource = getStaticModelCatalog("deepseek")[0];
   if (customSource === undefined) throw new Error("DeepSeek catalog is empty");
   await mkdir(axlHome, { recursive: true });
+  await writeFile(
+    join(axlHome, "mcp.json"),
+    JSON.stringify({
+      mcpServers: {
+        broken: { command: process.execPath, args: ["-e", "process.exit(7)"] },
+        fixture: {
+          command: process.execPath,
+          args: [
+            join(
+              dirname(fileURLToPath(import.meta.url)),
+              "../../extensions/mcp/test/fixtures/server.mjs",
+            ),
+          ],
+          roots: ["."],
+        },
+      },
+    }),
+  );
   await writeFile(
     join(axlHome, "models.json"),
     JSON.stringify({
@@ -249,9 +275,19 @@ test("assembles an authoritative local runtime without a presentation client", a
     axlHome,
     stateDirectory,
     socketPath,
-    defaults: { modelId: "gpt-5", thinkingLevel: "medium" },
+    defaults: {
+      modelId: "gpt-5",
+      thinkingLevel: "medium",
+      compaction: {
+        enabled: true,
+        reserveTokens: 12_000,
+        keepRecentTokens: 20_000,
+        modelOverrides: { "azure-openai-responses/gpt-5": { keepRecentTokens: 30_000 } },
+      },
+    },
     store,
     unsafe: true,
+    modelsDevAutoRefresh: { enabled: false },
   });
   context.after(() => daemon.stop());
   const client = await connectUnixClient(socketPath);
@@ -261,6 +297,65 @@ test("assembles an authoritative local runtime without a presentation client", a
     securityMode: "unsafe",
     sandboxProvider: "none",
   });
+  assert.equal(
+    (await client.listCommands()).commands.some((command) => command.name === "mcp"),
+    true,
+  );
+  assert.deepEqual(
+    (await client.listMcpServers()).servers.map((server) => [server.name, server.status]),
+    [
+      ["broken", "pending"],
+      ["fixture", "pending"],
+    ],
+  );
+  assert.deepEqual(
+    (
+      await client.batchUpsertMcpServers({
+        servers: [
+          { name: "docs", definition: { url: "https://mcp.example.com/mcp" } },
+          { name: "local", definition: { command: "example-mcp", enabled: false } },
+        ],
+      })
+    ).servers.map((server) => server.name),
+    ["broken", "docs", "fixture", "local"],
+  );
+  assert.equal((await client.removeMcpServer({ name: "docs" })).changed, true);
+  assert.equal((await client.removeMcpServer({ name: "local" })).changed, true);
+  const probed = await client.probeMcpServer({
+    name: "fixture",
+    definition: {
+      command: process.execPath,
+      args: [
+        join(
+          dirname(fileURLToPath(import.meta.url)),
+          "../../extensions/mcp/test/fixtures/server.mjs",
+        ),
+      ],
+      roots: ["."],
+    },
+  });
+  assert.deepEqual(
+    probed.tools.map((tool) => tool.name),
+    ["echo", "interactive", "tasker"],
+  );
+  await assert.rejects(
+    client.probeMcpServer({
+      name: "broken",
+      definition: { command: process.execPath, args: ["-e", "process.exit(7)"] },
+    }),
+    (error) =>
+      error instanceof AxlClientError &&
+      error.code === "mcp_probe_failed" &&
+      error.details?.server === "broken",
+  );
+  await assert.rejects(
+    client.probeMcpServer({ name: "plain", definition: { url: "http://example.com/mcp" } }),
+    (error) => error instanceof AxlClientError && error.code === "mcp_probe_failed",
+  );
+  assert.equal(
+    (await client.listMcpServers()).servers.find((server) => server.name === "fixture")?.status,
+    "discovered",
+  );
   const allProviders = await client.listProviders();
   assert.equal(allProviders.providers.length, 41);
   assert.deepEqual(
@@ -338,7 +433,10 @@ test("assembles an authoritative local runtime without a presentation client", a
     providerId: "deepseek",
     phase: "logged_out",
   });
-  const opened = await client.request("session.create", { cwd: workspace });
+  const opened = await client.request("session.create", {
+    cwd: workspace,
+    userQuestions: true,
+  });
   const subscription = await client.request("session.subscribe", {
     sessionId: opened.sessionId,
   });
@@ -358,11 +456,79 @@ test("assembles an authoritative local runtime without a presentation client", a
     events
       .filter((event) => event.type === "tool.schema")
       .map((event) => (event.type === "tool.schema" ? event.payload.name : "")),
-    ["bash", "read", "write", "edit", "web_fetch", "web_search"],
+    [
+      "bash",
+      "read",
+      "write",
+      "edit",
+      "web_fetch",
+      "web_search",
+      "ask_user_question",
+      "capability_search",
+    ],
   );
+  const mcpCache = JSON.parse(await readFile(join(axlHome, "cache", "mcp-tools.json"), "utf8")) as {
+    servers: Array<{ server: string; tools: Array<{ name: string }> }>;
+    failures: Array<{ server: string; error: string }>;
+  };
+  assert.equal(mcpCache.servers[0]?.server, "fixture");
+  assert.deepEqual(
+    mcpCache.servers[0]?.tools.map((tool) => tool.name),
+    ["echo", "interactive", "tasker"],
+  );
+  assert.deepEqual(
+    mcpCache.failures.map((failure) => failure.server),
+    ["broken"],
+  );
+  const projected = await client.listMcpServers();
+  assert.deepEqual(
+    projected.servers.map((server) => [server.name, server.status, server.tools.length]),
+    [
+      ["broken", "failed", 0],
+      ["fixture", "discovered", 3],
+    ],
+  );
+  assert.ok((projected.servers[0]?.error?.length ?? 0) > 0);
+  const prompt = events
+    .filter((event) => event.type === "prompt.section")
+    .map((event) => (event.type === "prompt.section" ? event.payload.content : ""))
+    .join("\n\n");
+  assert.match(prompt, /<project_instructions path=.*AGENTS\.md/);
+  assert.match(prompt, /Use the repository instructions\./);
+  assert.doesNotMatch(prompt, /Must not enter the stable prompt|<available_skills>/);
+  assert.deepEqual(events.find((event) => event.type === "context.resources")?.payload, {
+    resources: [
+      {
+        kind: "agents",
+        scope: "project",
+        path: join(workspace, "AGENTS.md"),
+        content: "Use the repository instructions.",
+      },
+    ],
+  });
+
+  const pushed: CanonicalEvent[] = [];
+  client.onEvent((message) => pushed.push(message.event));
+  await writeFile(join(workspace, "AGENTS.override.md"), "Use the reloaded override.\n");
+  const reloaded = await client.request("session.reload", { sessionId: opened.sessionId });
+  const reloadedResources = pushed.find(
+    (event) => event.type === "context.resources" && reloaded.boundaryEventIds.includes(event.id),
+  );
+  assert.deepEqual(
+    reloadedResources?.type === "context.resources"
+      ? reloadedResources.payload.resources.map(({ path, content }) => [path, content])
+      : undefined,
+    [[join(workspace, "AGENTS.override.md"), "Use the reloaded override."]],
+  );
+
   assert.deepEqual(events.find((event) => event.type === "config.request")?.payload, {
     maxOutputTokens: null,
     httpIdleTimeoutMs: 300_000,
+  });
+  assert.deepEqual(events.find((event) => event.type === "config.compaction")?.payload, {
+    enabled: true,
+    reserveTokens: 12_000,
+    keepRecentTokens: 30_000,
   });
   assert.deepEqual(events.find((event) => event.type === "config.profile")?.payload, {
     profile: "standard",
@@ -370,7 +536,28 @@ test("assembles an authoritative local runtime without a presentation client", a
   assert.deepEqual(events.find((event) => event.type === "config.tools")?.payload, {
     webFetch: true,
     webSearch: true,
+    userQuestions: true,
   });
+
+  const unattended = await client.request("session.create", { cwd: workspace });
+  const unattendedSubscription = await client.request("session.subscribe", {
+    sessionId: unattended.sessionId,
+  });
+  assert.equal(
+    unattendedSubscription.snapshot?.page.events.some(
+      (event) => event.type === "tool.schema" && event.payload.name === "ask_user_question",
+    ),
+    false,
+  );
+  assert.equal(
+    unattendedSubscription.snapshot?.page.events
+      .filter((event) => event.type === "prompt.section")
+      .some(
+        (event) =>
+          event.type === "prompt.section" && event.payload.content.includes("ask_user_question"),
+      ),
+    false,
+  );
 
   for (const [profile, expectedTools] of [
     ["minimal", ["bash", "edit"]],
@@ -388,4 +575,240 @@ test("assembles an authoritative local runtime without a presentation client", a
       expectedTools,
     );
   }
+});
+
+test("shares extension-registered providers across daemon sessions", async (context) => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "axl-provider-")));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const axlHome = join(root, ".axl");
+  const workspace = join(root, "workspace");
+  const stateDirectory = join(axlHome, "unsafe");
+  const socketPath = join(stateDirectory, "axl.sock");
+  await mkdir(join(axlHome, "extensions"), { recursive: true });
+  await mkdir(workspace);
+  const sourceModel = getStaticModelCatalog("deepseek")[0];
+  if (sourceModel === undefined) throw new Error("DeepSeek catalog is empty");
+  const model = { ...sourceModel, providerId: "extension-provider", modelId: "extension-model" };
+  await writeFile(
+    join(axlHome, "extensions", "provider.js"),
+    `const model = ${JSON.stringify(model)};
+const provider = {
+  id: "extension-provider",
+  displayName: "Extension Provider",
+  authMethods: [],
+  listModels: async () => [model],
+  stream: async function* () {
+    yield { type: "text_delta", text: "extension provider reply" };
+    yield { type: "completed", stopReason: "stop", usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 } };
+  }
+};
+export default (axl) => axl.registerProvider(provider);
+`,
+  );
+  const store = new FileCredentialStore(join(axlHome, "credentials.json"));
+  await store.modify("azure-openai", () =>
+    Promise.resolve({
+      type: "api_key",
+      key: "obviously-fake-runtime-test-key",
+      env: { AZURE_OPENAI_BASE_URL: "https://example.invalid/openai/v1" },
+    }),
+  );
+  const daemon = await startLocalDaemon({
+    axlHome,
+    stateDirectory,
+    socketPath,
+    defaults: { modelId: "gpt-5", thinkingLevel: "off" },
+    store,
+    unsafe: true,
+    modelsDevAutoRefresh: { enabled: false },
+  });
+  context.after(() => daemon.stop());
+  const client = await connectUnixClient(socketPath);
+  context.after(() => client.close());
+  const created = await client.request("session.create", {
+    cwd: workspace,
+    providerId: "extension-provider",
+    modelId: "extension-model",
+  });
+  const sent = await client.request("session.send", {
+    sessionId: created.sessionId,
+    delivery: "prompt",
+    content: [{ type: "text", text: "hello" }],
+  });
+  assert.equal(sent.stopReason, "stop");
+  const log = await readFile(
+    join(stateDirectory, "sessions", `${created.sessionId}.jsonl`),
+    "utf8",
+  );
+  assert.match(log, /extension provider reply/u);
+});
+
+test("disposes loaded daemon extensions when later runtime setup fails", async (context) => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "axl-runtime-extension-cleanup-")));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const axlHome = join(root, ".axl");
+  const workspace = join(root, "workspace");
+  const stateDirectory = join(axlHome, "unsafe");
+  const socketPath = join(stateDirectory, "axl.sock");
+  const marker = join(root, "cleanup.txt");
+  await mkdir(join(axlHome, "extensions"), { recursive: true });
+  await mkdir(workspace);
+  await writeFile(
+    join(axlHome, "extensions", "cleanup.js"),
+    `import { appendFile } from "node:fs/promises";\nexport default (axl) => { axl.track(() => appendFile(${JSON.stringify(marker)}, "disposed\\n")); axl.on("resources_discover", () => { throw new Error("resource failure"); }); };\n`,
+  );
+  const daemon = await startLocalDaemon({
+    axlHome,
+    stateDirectory,
+    socketPath,
+    defaults: { modelId: "gpt-5", thinkingLevel: "off" },
+    store: new FileCredentialStore(join(axlHome, "credentials.json")),
+    unsafe: true,
+    modelsDevAutoRefresh: { enabled: false },
+  });
+  context.after(() => daemon.stop());
+  const client = await connectUnixClient(socketPath);
+  context.after(() => client.close());
+
+  await assert.rejects(client.request("session.create", { cwd: workspace }), AxlClientError);
+  assert.equal(await readFile(marker, "utf8"), "disposed\n");
+});
+
+test("manages global, explicit, and trusted project daemon extensions through the SDK", async (context) => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "axl-")));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const axlHome = join(root, ".axl");
+  const workspace = join(root, "workspace");
+  const stateDirectory = join(axlHome, "unsafe");
+  const socketPath = join(stateDirectory, "axl.sock");
+  const marker = join(root, "loaded.txt");
+  await mkdir(join(axlHome, "extensions"), { recursive: true });
+  await mkdir(join(workspace, ".git"), { recursive: true });
+  await mkdir(join(workspace, ".axl", "extensions"), { recursive: true });
+  const source = (name: string) =>
+    `import { appendFile } from "node:fs/promises";\nexport default async (axl) => { await appendFile(${JSON.stringify(marker)}, ${JSON.stringify(`${name}\n`)}); axl.on("resources_discover", () => [{ name: "${name}-rules", content: "${name} rules" }]); axl.registerCommand({ name: "${name}-command", description: "${name} command", execute: async (args) => { if (args.action === "info") return JSON.stringify(await axl.session.info()); if (args.action === "activate") return JSON.stringify(await axl.session.activateTools(["extension:${name}/${name}_tool"])); const calls = Number(axl.state.get("calls") ?? 0) + 1; await axl.state.set("calls", calls); await axl.emit("command", { calls }); return "${name}:" + String(args.value) + ":" + calls; } }); axl.registerTool({ name: ${JSON.stringify(`${name}_tool`)}, description: ${JSON.stringify(name)}, inputSchema: { type: "object" }, execute: () => ({ content: [] }) }); };\n`;
+  await writeFile(join(axlHome, "extensions", "global.js"), source("global"));
+  await writeFile(join(workspace, ".axl", "extensions", "project.js"), source("project"));
+  const explicitPath = join(root, "explicit.js");
+  await writeFile(explicitPath, source("explicit"));
+  const store = new FileCredentialStore(join(axlHome, "credentials.json"));
+  await store.modify("azure-openai", () =>
+    Promise.resolve({
+      type: "api_key",
+      key: "obviously-fake-runtime-test-key",
+      env: { AZURE_OPENAI_BASE_URL: "https://example.invalid/openai/v1" },
+    }),
+  );
+
+  const daemon = await startLocalDaemon({
+    axlHome,
+    stateDirectory,
+    socketPath,
+    defaults: { modelId: "gpt-5", thinkingLevel: "off" },
+    store,
+    unsafe: true,
+    modelsDevAutoRefresh: { enabled: false },
+  });
+  context.after(() => daemon.stop());
+  const client = await connectUnixClient(socketPath);
+  context.after(() => client.close());
+  const opened = await client.request("session.create", { cwd: workspace });
+
+  const initialExtensions = await client.listExtensions({ sessionId: opened.sessionId });
+  assert.deepEqual(
+    initialExtensions.extensions.map((item) => item.id),
+    ["axl.prompt-templates", "axl.skills", "global"],
+  );
+  assert.equal(initialExtensions.extensions[0]?.source, "builtin");
+  const disabledBuiltin = await client.disableExtension({
+    sessionId: opened.sessionId,
+    extensionId: "axl.prompt-templates",
+  });
+  assert.equal(disabledBuiltin.extensions[0]?.enabled, false);
+  await client.enableExtension({
+    sessionId: opened.sessionId,
+    extensionId: "axl.prompt-templates",
+  });
+  assert.deepEqual(
+    initialExtensions.commands.map((command) => command.name),
+    ["extensions", "global-command"],
+  );
+  assert.equal(
+    (await client.listCommands({ sessionId: opened.sessionId })).commands.some(
+      (command) => command.extensionId === "global" && command.name === "global-command",
+    ),
+    true,
+  );
+  assert.deepEqual(
+    await client.invokeExtensionCommand({
+      sessionId: opened.sessionId,
+      name: "global-command",
+      args: { value: 1 },
+    }),
+    { content: "global:1:1" },
+  );
+  const info = await client.invokeExtensionCommand({
+    sessionId: opened.sessionId,
+    name: "global-command",
+    args: { action: "info" },
+  });
+  assert.equal(JSON.parse(info.content ?? "{}").modelId, "gpt-5");
+  const activated = await client.invokeExtensionCommand({
+    sessionId: opened.sessionId,
+    name: "global-command",
+    args: { action: "activate" },
+  });
+  assert.equal(JSON.parse(activated.content ?? "[]").includes("global_tool"), true);
+  const initial = await client.request("session.subscribe", { sessionId: opened.sessionId });
+  assert.equal(
+    initial.snapshot?.page.events.some(
+      (event) =>
+        event.type === "context.resources" &&
+        event.payload.resources.some(
+          (resource) => resource.path === "extension:global/global-rules",
+        ),
+    ),
+    true,
+  );
+  const trusted = await client.trustExtensionProject({
+    sessionId: opened.sessionId,
+    trusted: true,
+  });
+  assert.equal(trusted.project.trusted, true);
+  assert.deepEqual(
+    trusted.extensions.map((item) => item.id),
+    ["axl.prompt-templates", "axl.skills", "global", "project"],
+  );
+  assert.deepEqual(
+    await client.invokeExtensionCommand({
+      sessionId: opened.sessionId,
+      name: "global-command",
+      args: { value: 2 },
+    }),
+    { content: "global:2:2" },
+  );
+  const disabled = await client.disableExtension({
+    sessionId: opened.sessionId,
+    extensionId: "project",
+  });
+  assert.equal(disabled.extensions.find((item) => item.id === "project")?.enabled, false);
+  await client.enableExtension({ sessionId: opened.sessionId, extensionId: "project" });
+  const installed = await client.installExtension({
+    sessionId: opened.sessionId,
+    source: { type: "path", path: explicitPath },
+  });
+  assert.equal(installed.changedExtensionId, "explicit");
+  await client.reloadExtension({ sessionId: opened.sessionId, extensionId: "explicit" });
+  const removed = await client.removeExtension({
+    sessionId: opened.sessionId,
+    extensionId: "explicit",
+  });
+  assert.equal(
+    removed.extensions.some((item) => item.id === "explicit"),
+    false,
+  );
+  assert.match(await readFile(marker, "utf8"), /global\nproject\n/u);
+  const log = await readFile(join(stateDirectory, "sessions", `${opened.sessionId}.jsonl`), "utf8");
+  assert.match(log, /"type":"extension.state"/u);
+  assert.match(log, /"type":"extension.event"/u);
 });

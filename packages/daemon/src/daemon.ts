@@ -2,15 +2,17 @@
 // SPDX-FileCopyrightText: 2026 Kaushik Kumar
 // SPDX-FileCopyrightText: 2026 Lokesh
 // SPDX-FileCopyrightText: 2026 VishnuM449
+// SPDX-FileCopyrightText: 2026 Shaan Narendran
 // SPDX-License-Identifier: Apache-2.0
 
 import { createHash, randomUUID } from "node:crypto";
 import type { Stats } from "node:fs";
-import { chmod, lstat, mkdir, realpath, unlink } from "node:fs/promises";
+import { appendFile, chmod, lstat, mkdir, realpath, rename, stat, unlink } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 
+import { ExtensionHostError } from "@axl/kernel";
 import {
   type AttachmentPresence,
   type CanonicalEvent,
@@ -51,8 +53,10 @@ import {
 } from "@axl/protocol";
 
 import { commandCatalog } from "./command-catalog.ts";
+import { findExtension, type ExtensionManagementService } from "./extension-management.ts";
 import { type CommandAcceptance, CommandJournal, CommandJournalError } from "./command-journal.ts";
 import { DataDirectoryLock } from "./data-directory-lock.ts";
+import type { McpConfigurationService } from "./mcp-configuration.ts";
 import type { ProviderManagementService } from "./provider-management.ts";
 import { DaemonError, SessionManager, type SessionManagerOptions } from "./session-manager.ts";
 
@@ -72,6 +76,8 @@ export interface DaemonOptions extends SessionManagerOptions {
   readonly heartbeatIntervalMs?: number;
   readonly presenceTimeoutMs?: number;
   readonly providerManagement?: ProviderManagementService;
+  readonly mcpConfiguration?: McpConfigurationService;
+  readonly extensionManagement?: ExtensionManagementService;
 }
 
 const MAX_PENDING_REQUESTS = 64;
@@ -84,6 +90,29 @@ const MAX_EVENT_CURSORS = 16_384;
 const HEARTBEAT_INTERVAL_MS = 20_000;
 const PRESENCE_TIMEOUT_MS = 60_000;
 const SOCKET_PROBE_TIMEOUT_MS = 500;
+const MAX_DIAGNOSTIC_LOG_BYTES = 1024 * 1024;
+const MAX_DIAGNOSTIC_ENTRY_CHARS = 4_096;
+
+/** Describe an internal failure for the private daemon log, following a short cause chain. */
+function describeInternalError(error: unknown): string {
+  const parts: string[] = [];
+  let current: unknown = error;
+  for (let depth = 0; depth < 4 && current !== undefined; depth += 1) {
+    if (current instanceof Error) {
+      const code =
+        "code" in current && typeof current.code === "string" ? ` [${current.code}]` : "";
+      parts.push(`${current.name}${code}: ${current.message}`);
+      current = current.cause;
+    } else {
+      parts.push(String(current));
+      current = undefined;
+    }
+  }
+  return parts
+    .join(" <- caused by ")
+    .replace(/[\r\n]+/gu, " ")
+    .slice(0, MAX_DIAGNOSTIC_ENTRY_CHARS);
+}
 
 export function normalizeDaemonRpcErrorCode(method: WireRequest["method"], code: string): string {
   return isKnownRpcErrorCode(code) && isRpcErrorAllowed(method, code) ? code : "internal_error";
@@ -207,6 +236,8 @@ export class AxlDaemon {
   private readonly heartbeatIntervalMs: number;
   private readonly presenceTimeoutMs: number;
   private readonly providerManagement: ProviderManagementService | undefined;
+  private readonly mcpConfiguration: McpConfigurationService | undefined;
+  private readonly extensionManagement: ExtensionManagementService | undefined;
   private readonly capabilities: readonly string[];
   private readonly hostOptions: Pick<
     DaemonOptions,
@@ -227,6 +258,7 @@ export class AxlDaemon {
   private readonly connectionStates = new Set<ConnectionState>();
   private readonly cursors = new Map<EventCursor, CursorRecord>();
   private sessionCatalogGeneration = 0;
+  private diagnosticWrites: Promise<void> = Promise.resolve();
 
   constructor(options: DaemonOptions) {
     this.hostOptions = options;
@@ -245,10 +277,14 @@ export class AxlDaemon {
     this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? HEARTBEAT_INTERVAL_MS;
     this.presenceTimeoutMs = options.presenceTimeoutMs ?? PRESENCE_TIMEOUT_MS;
     this.providerManagement = options.providerManagement;
-    this.capabilities =
-      this.providerManagement === undefined
-        ? WIRE_CAPABILITIES.filter((capability) => !capability.startsWith("provider."))
-        : WIRE_CAPABILITIES;
+    this.mcpConfiguration = options.mcpConfiguration;
+    this.extensionManagement = options.extensionManagement;
+    this.capabilities = WIRE_CAPABILITIES.filter(
+      (capability) =>
+        (this.providerManagement !== undefined || !capability.startsWith("provider.")) &&
+        (this.mcpConfiguration !== undefined || !capability.startsWith("mcp.config.")) &&
+        (this.extensionManagement !== undefined || !capability.startsWith("extension.")),
+    );
     if (
       !Number.isSafeInteger(this.snapshotIdleLifetimeMs) ||
       this.snapshotIdleLifetimeMs <= 0 ||
@@ -801,6 +837,22 @@ export class AxlDaemon {
         request.method === "provider.auth.status" ||
         request.method === "provider.auth.login" ||
         request.method === "provider.auth.logout" ||
+        request.method === "extension.enable" ||
+        request.method === "extension.disable" ||
+        request.method === "extension.reload" ||
+        request.method === "extension.install" ||
+        request.method === "extension.update" ||
+        request.method === "extension.remove" ||
+        request.method === "extension.trust" ||
+        request.method === "extension.command.invoke" ||
+        request.method === "mcp.config.probe" ||
+        request.method === "session.create" ||
+        request.method === "session.resume" ||
+        request.method === "session.fork" ||
+        request.method === "session.clone" ||
+        request.method === "session.rename" ||
+        request.method === "session.reload" ||
+        request.method === "session.configure" ||
         request.method === "session.history" ||
         request.method === "session.workspace.list" ||
         request.method === "session.workspace.read" ||
@@ -834,12 +886,15 @@ export class AxlDaemon {
       const reportedCode =
         error instanceof DaemonError || error instanceof CommandJournalError
           ? error.code
-          : error instanceof CanonicalEventSizeError
-            ? "content_too_large"
-            : error instanceof DOMException && error.name === "AbortError"
-              ? "cancelled"
-              : "internal_error";
+          : error instanceof ExtensionHostError
+            ? "extension_failed"
+            : error instanceof CanonicalEventSizeError
+              ? "content_too_large"
+              : error instanceof DOMException && error.name === "AbortError"
+                ? "cancelled"
+                : "internal_error";
       const code = normalizeDaemonRpcErrorCode(request.method, reportedCode);
+      if (code === "internal_error") this.recordInternalError(request.method, error);
       send({
         kind: "error",
         id: request.id,
@@ -856,15 +911,17 @@ export class AxlDaemon {
           ...((error instanceof DaemonError || error instanceof CommandJournalError) &&
           error.details !== undefined
             ? { details: error.details }
-            : error instanceof CanonicalEventSizeError
-              ? {
-                  details: {
-                    field: "canonicalEvent",
-                    encodedBytes: error.encodedBytes,
-                    maximumBytes: error.maximumBytes,
-                  },
-                }
-              : {}),
+            : error instanceof ExtensionHostError
+              ? { details: error.details }
+              : error instanceof CanonicalEventSizeError
+                ? {
+                    details: {
+                      field: "canonicalEvent",
+                      encodedBytes: error.encodedBytes,
+                      maximumBytes: error.maximumBytes,
+                    },
+                  }
+                : {}),
         },
       });
     } finally {
@@ -978,7 +1035,7 @@ export class AxlDaemon {
           ...(affectedOperationId === undefined ? {} : { affectedOperationId }),
           ...(interactionId === undefined ? {} : { interactionId }),
         },
-        (acceptance) => this.dispatch(normalized, send, state, acceptance) as never,
+        (acceptance) => this.dispatch(normalized, send, state, acceptance, signal) as never,
       );
     } finally {
       if (interruptDeliveryOperationId !== undefined) {
@@ -1021,8 +1078,30 @@ export class AxlDaemon {
         controller?.abort();
         return { cancellationRequested: controller !== undefined };
       }
-      case "command.list":
-        return commandCatalog(state.grantedCapabilities, request.params.sessionId);
+      case "command.list": {
+        const catalog = commandCatalog(state.grantedCapabilities, request.params.sessionId);
+        if (request.params.sessionId === undefined) return catalog;
+        const extensions = await this.sessions.extensionCommands(request.params.sessionId);
+        if (extensions.length === 0) return catalog;
+        const commands = [
+          ...catalog.commands,
+          ...extensions.map((command) => ({
+            id: `extension:${command.extensionId}/${command.name}`,
+            name: command.name,
+            aliases: [],
+            description: command.description,
+            context: "session" as const,
+            argument: { required: false, hint: "arguments" },
+            requiredCapabilities: ["extension.command.invoke" as const],
+            availability: { state: "available" as const },
+            extensionId: command.extensionId,
+          })),
+        ].sort((left, right) => left.name.localeCompare(right.name));
+        return {
+          generation: createHash("sha256").update(JSON.stringify(commands)).digest("hex"),
+          commands,
+        };
+      }
       case "provider.list":
         return this.providers().list(request.params, signal);
       case "provider.catalog.refresh":
@@ -1033,6 +1112,33 @@ export class AxlDaemon {
         return this.providers().login(request.params, signal);
       case "provider.auth.logout":
         return this.providers().logout(request.params, signal);
+      case "extension.list":
+        return this.extensionInventory(request.params.sessionId);
+      case "extension.enable":
+      case "extension.disable":
+      case "extension.reload":
+      case "extension.install":
+      case "extension.update":
+      case "extension.remove":
+      case "extension.trust":
+        return this.mutateExtension(request, this.mutationOperationId(acceptance), signal);
+      case "extension.command.invoke":
+        return this.sessions.invokeExtensionCommand(
+          request.params.sessionId,
+          request.params.name,
+          request.params.args,
+          signal,
+        );
+      case "mcp.config.list":
+        return this.mcpConfigurationService().list();
+      case "mcp.config.upsert":
+        return this.mcpConfigurationService().upsert(request.params);
+      case "mcp.config.batch":
+        return this.mcpConfigurationService().batch(request.params);
+      case "mcp.config.remove":
+        return this.mcpConfigurationService().remove(request.params);
+      case "mcp.config.probe":
+        return this.mcpConfigurationService().probe(request.params, signal);
       case "session.create": {
         const {
           cwd,
@@ -1041,6 +1147,7 @@ export class AxlDaemon {
           thinkingLevel,
           webFetch,
           webSearch,
+          userQuestions,
           profile,
           requestSettings,
         } = request.params;
@@ -1054,14 +1161,16 @@ export class AxlDaemon {
             ...(thinkingLevel === undefined ? {} : { thinkingLevel }),
             ...(webFetch === undefined ? {} : { webFetch }),
             ...(webSearch === undefined ? {} : { webSearch }),
+            ...(userQuestions === undefined ? {} : { userQuestions }),
             profile: profile ?? "standard",
           },
           reservation,
+          signal,
         );
         return this.sessions.describe(created.sessionId);
       }
       case "session.resume":
-        await this.sessions.resume(request.params.sessionId);
+        await this.sessions.resume(request.params.sessionId, signal);
         return this.sessions.describe(request.params.sessionId);
       case "session.list":
         return this.listSessions(state, request.params);
@@ -1076,6 +1185,7 @@ export class AxlDaemon {
           request.params.sessionId,
           request.params.fromEventId,
           this.creationReservation(acceptance),
+          signal,
         );
         return {
           ...this.sessions.describe(forked.sessionId),
@@ -1086,6 +1196,7 @@ export class AxlDaemon {
         const cloned = await this.sessions.clone(
           request.params.sessionId,
           this.creationReservation(acceptance),
+          signal,
         );
         return {
           ...this.sessions.describe(cloned.sessionId),
@@ -1097,6 +1208,7 @@ export class AxlDaemon {
           request.params.sessionId,
           request.params.title,
           this.mutationOperationId(acceptance),
+          signal,
         );
       case "session.delete":
         await this.sessions.delete(request.params.sessionId);
@@ -1144,7 +1256,11 @@ export class AxlDaemon {
             : parseOperationId(acceptance.affectedOperationId, "affectedOperationId"),
         );
       case "session.compact":
-        return this.sessions.compact(request.params.sessionId, request.params.instructions);
+        return this.sessions.compact(
+          request.params.sessionId,
+          request.params.instructions,
+          this.mutationOperationId(acceptance),
+        );
       case "session.queue.enqueue":
         return this.sessions.enqueue(
           request.params.sessionId,
@@ -1183,7 +1299,11 @@ export class AxlDaemon {
             : parseOperationId(acceptance.affectedOperationId, "affectedOperationId"),
         );
       case "session.reload":
-        return this.sessions.reload(request.params.sessionId, this.mutationOperationId(acceptance));
+        return this.sessions.reload(
+          request.params.sessionId,
+          this.mutationOperationId(acceptance),
+          signal,
+        );
       case "session.configure": {
         const {
           sessionId,
@@ -1192,6 +1312,7 @@ export class AxlDaemon {
           thinkingLevel,
           webFetch,
           webSearch,
+          userQuestions,
           profile,
           requestSettings,
         } = request.params;
@@ -1204,9 +1325,11 @@ export class AxlDaemon {
             ...(thinkingLevel === undefined ? {} : { thinkingLevel }),
             ...(webFetch === undefined ? {} : { webFetch }),
             ...(webSearch === undefined ? {} : { webSearch }),
+            ...(userQuestions === undefined ? {} : { userQuestions }),
             ...(profile === undefined ? {} : { profile }),
           },
           this.mutationOperationId(acceptance),
+          signal,
         );
       }
       case "session.interaction.respond": {
@@ -1270,6 +1393,122 @@ export class AxlDaemon {
         await this.sessions.dispose(request.params.sessionId, this.mutationOperationId(acceptance));
         return { disposed: true, historyPreserved: true };
     }
+  }
+
+  private async extensionInventory(sessionId: SessionId) {
+    const cwd = await this.sessions.cwd(sessionId);
+    return {
+      ...(await this.extensionManagementService().list(cwd)),
+      commands: await this.sessions.extensionCommands(sessionId),
+    };
+  }
+
+  private async mutateExtension(
+    request: Extract<
+      WireRequest,
+      {
+        readonly method:
+          | "extension.enable"
+          | "extension.disable"
+          | "extension.reload"
+          | "extension.install"
+          | "extension.update"
+          | "extension.remove"
+          | "extension.trust";
+      }
+    >,
+    operationId: ReturnType<typeof parseOperationId> | undefined,
+    signal?: AbortSignal,
+  ) {
+    if (operationId === undefined) {
+      throw new DaemonError("internal_error", "Extension operation ID is missing");
+    }
+    const service = this.extensionManagementService();
+    const cwd = await this.sessions.cwd(request.params.sessionId);
+    let extensionId: string | undefined;
+    try {
+      if (request.method === "extension.enable") {
+        extensionId = request.params.extensionId;
+        if (findExtension(await service.list(cwd), extensionId) === undefined) {
+          throw new Error(`Extension ${extensionId} was not found`);
+        }
+        await service.setEnabled(extensionId, true);
+      } else if (request.method === "extension.disable") {
+        extensionId = request.params.extensionId;
+        if (findExtension(await service.list(cwd), extensionId) === undefined) {
+          throw new Error(`Extension ${extensionId} was not found`);
+        }
+        await service.setEnabled(extensionId, false);
+      } else if (request.method === "extension.install") {
+        extensionId = await service.install(request.params.source, signal);
+      } else if (request.method === "extension.update") {
+        extensionId = request.params.extensionId;
+        await service.update(extensionId, signal);
+      } else if (request.method === "extension.remove") {
+        extensionId = request.params.extensionId;
+        await service.remove(extensionId, signal);
+      } else if (request.method === "extension.trust") {
+        const decided = await this.sessions.interceptExtensionCommand(
+          request.params.sessionId,
+          "project_trust",
+          { trusted: request.params.trusted, path: cwd },
+          signal,
+        );
+        if (typeof decided.trusted !== "boolean") {
+          throw new Error("project_trust handler returned an invalid trust decision");
+        }
+        await service.trustProject(cwd, decided.trusted);
+      } else {
+        extensionId = request.params.extensionId;
+        const current = findExtension(await service.list(cwd), extensionId);
+        if (current === undefined || !current.enabled) {
+          throw new Error(`Enabled extension ${extensionId} was not found`);
+        }
+      }
+      const reloaded = await this.sessions.reloadIfOpen(
+        request.params.sessionId,
+        operationId,
+        signal,
+      );
+      return {
+        ...(await service.list(cwd)),
+        commands: this.sessions.extensionCommandsIfOpen(request.params.sessionId),
+        ...(extensionId === undefined ? {} : { changedExtensionId: extensionId }),
+        boundaryEventIds: reloaded.boundaryEventIds,
+      };
+    } catch (error) {
+      if (
+        error instanceof DaemonError ||
+        error instanceof ExtensionHostError ||
+        (error instanceof DOMException && error.name === "AbortError")
+      ) {
+        throw error;
+      }
+      throw new ExtensionHostError(error instanceof Error ? error.message : String(error), {
+        ...(extensionId === undefined ? {} : { extensionId }),
+        phase: request.method,
+      });
+    }
+  }
+
+  private extensionManagementService(): ExtensionManagementService {
+    if (this.extensionManagement === undefined) {
+      throw new DaemonError(
+        "unsupported_capability",
+        "Extension management is not available in this daemon",
+      );
+    }
+    return this.extensionManagement;
+  }
+
+  private mcpConfigurationService(): McpConfigurationService {
+    if (this.mcpConfiguration === undefined) {
+      throw new DaemonError(
+        "unsupported_capability",
+        "MCP configuration is not available in this daemon",
+      );
+    }
+    return this.mcpConfiguration;
   }
 
   private providers(): ProviderManagementService {
@@ -1540,6 +1779,33 @@ export class AxlDaemon {
     subscription.pageResults.set(pageCursor, page);
     if (page.complete) subscription.finalPageServed = true;
     return { snapshotId, page };
+  }
+
+  /**
+   * Clients receive only a generic internal error. Keep the actionable detail in a private,
+   * size-bounded log beside the daemon data and on stderr for foreground daemons.
+   */
+  private recordInternalError(method: string, error: unknown): void {
+    const path = join(this.dataDirectory, "daemon.log");
+    const line = `${new Date().toISOString()} internal_error ${method}: ${describeInternalError(error)}\n`;
+    process.stderr.write(line);
+    this.diagnosticWrites = this.diagnosticWrites
+      .then(async () => {
+        const size = await stat(path).then(
+          (info) => info.size,
+          (cause: NodeJS.ErrnoException) => {
+            if (cause.code === "ENOENT") return 0;
+            throw cause;
+          },
+        );
+        if (size > MAX_DIAGNOSTIC_LOG_BYTES) await rename(path, `${path}.1`);
+        await appendFile(path, line, { mode: 0o600 });
+      })
+      .catch((cause: unknown) => {
+        process.stderr.write(
+          `Axl daemon could not write ${path}: ${cause instanceof Error ? cause.message : String(cause)}\n`,
+        );
+      });
   }
 
   private acknowledge(

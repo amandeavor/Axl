@@ -23,12 +23,24 @@ const TEMPLATE = join(ROOT, "distribution", "npm", "package.json");
 const STAGE = join(ROOT, ".release", "npm");
 const ARTIFACTS = join(ROOT, ".release", "artifacts");
 
+/**
+ * Runtime packages left out of the bundle. Each must be a declared release dependency.
+ * The Landlock addon resolves its per-platform launcher package at runtime.
+ */
+export const RELEASE_EXTERNALS = [
+  "@deepseek-ai/node-addon-landlock-run",
+  "@modelcontextprotocol/sdk",
+  "@modelcontextprotocol/sdk/*",
+  "yaml",
+] as const;
+
 export interface ReleasePackageManifest {
   readonly name: "@observal/axl";
   readonly version: string;
   readonly description: string;
   readonly type: "module";
   readonly bin: Readonly<Record<"axl", string>>;
+  readonly exports: Readonly<Record<"./extension-api", Readonly<Record<"types", string>>>>;
   readonly engines: Readonly<Record<"node", string>>;
   readonly files: readonly string[];
   readonly license: "Apache-2.0";
@@ -70,8 +82,9 @@ export function publicManifest(
     description: String(source.description),
     type: "module",
     bin: { axl: "dist/axl.js" },
+    exports: { "./extension-api": { types: "./dist/extension-api.d.ts" } },
     engines: { node: "^22.19.0 || >=24.0.0" },
-    files: ["dist", "LICENSE", "LICENSES", "NOTICE", "README.md"],
+    files: ["dist", "assets", "LICENSE", "LICENSES", "NOTICE", "README.md"],
     license: "Apache-2.0",
     repository: source.repository as Record<string, string>,
     bugs: source.bugs as Record<string, string>,
@@ -119,7 +132,7 @@ export function buildReleasePackage(versionOverride?: string): ReleasePackageRes
     banner: {
       js: 'import { createRequire as __axlCreateRequire } from "node:module";\nconst require = __axlCreateRequire(import.meta.url);',
     },
-    external: ["@modelcontextprotocol/sdk", "@modelcontextprotocol/sdk/*", "yaml"],
+    external: [...RELEASE_EXTERNALS],
     define: {
       "process.env.AXL_BUILD_VERSION": JSON.stringify(manifest.version),
       "process.env.AXL_WEB_ASSET_PATH": JSON.stringify("web"),
@@ -131,11 +144,18 @@ export function buildReleasePackage(versionOverride?: string): ReleasePackageRes
     writeFileSync(executable, bundled);
   }
   chmodSync(executable, 0o755);
+  copyFileSync(
+    join(ROOT, "packages", "extensions", "api", "dist", "index.d.ts"),
+    join(STAGE, "dist", "extension-api.d.ts"),
+  );
   cpSync(join(ROOT, "packages", "web", "dist"), join(STAGE, "dist", "web"), {
     recursive: true,
   });
 
   writeFileSync(join(STAGE, "package.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+  // The bundle resolves presentation assets relative to dist/axl.js, so they
+  // ship beside it.
+  cpSync(join(ROOT, "packages", "tui", "assets"), join(STAGE, "assets"), { recursive: true });
   copyFileSync(join(ROOT, "distribution", "npm", "README.md"), join(STAGE, "README.md"));
   copyFileSync(join(ROOT, "LICENSE"), join(STAGE, "LICENSE"));
   cpSync(join(ROOT, "LICENSES"), join(STAGE, "LICENSES"), { recursive: true });

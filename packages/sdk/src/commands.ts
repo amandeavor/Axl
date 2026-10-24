@@ -6,10 +6,10 @@ import {
   type CommandListResult,
   type EventId,
   type ModelRequestSettings,
-  parseCommandListResult,
-  parseModelRequestSettings,
   type ProviderAuthenticationStatus,
   type ProviderCatalogRefreshResult,
+  parseCommandListResult,
+  parseModelRequestSettings,
   type SessionConfiguration,
   type SessionForkResult,
   type SessionId,
@@ -39,6 +39,7 @@ export type CommandSurface =
   | "model"
   | "thinking"
   | "providers"
+  | "mcp"
   | "login"
   | "logout"
   | "request"
@@ -58,7 +59,8 @@ export interface CommandInvocationOptions {
 }
 
 export type CommandOutcome =
-  | { readonly state: "completed"; readonly command: string }
+  | { readonly state: "completed"; readonly command: string; readonly content?: string }
+  | { readonly state: "queued"; readonly command: string }
   | {
       readonly state: "session-configured";
       readonly command: "model" | "thinking" | "request";
@@ -210,6 +212,21 @@ export class CommandController {
     if (command.context === "session" && sessionId === undefined) {
       throw new AxlClientError("command_unavailable", "Open a session first");
     }
+    if (command.extensionId !== undefined) {
+      const result = await this.client.invokeExtensionCommand(
+        {
+          sessionId: sessionId as SessionId,
+          name: command.name,
+          args: { ...(argument === undefined ? {} : { argument }) },
+        },
+        options,
+      );
+      return {
+        state: "completed",
+        command: command.name,
+        ...(result.content === undefined ? {} : { content: result.content }),
+      };
+    }
 
     switch (command.name) {
       case "model": {
@@ -244,6 +261,7 @@ export class CommandController {
         return { state: "session-configured", command: "thinking", update };
       }
       case "providers":
+      case "mcp":
       case "login":
         return {
           state: "focus",
@@ -353,12 +371,13 @@ export class CommandController {
         if (argument) throw new AxlClientError("invalid_command_argument", "Use /reload");
         await this.client.request("session.reload", { sessionId: sessionId as SessionId });
         return { state: "completed", command: command.name };
-      case "compact":
-        await this.client.request("session.compact", {
+      case "compact": {
+        const result = await this.client.request("session.compact", {
           sessionId: sessionId as SessionId,
           ...(argument === undefined ? {} : { instructions: argument }),
         });
-        return { state: "completed", command: command.name };
+        return { state: result.state, command: command.name };
+      }
       case "clone": {
         if (argument) throw new AxlClientError("invalid_command_argument", "Use /clone");
         const session = await this.client.request("session.clone", {

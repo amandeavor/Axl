@@ -1,17 +1,37 @@
 // SPDX-FileCopyrightText: 2026 Hari Srinivasan
+// SPDX-FileCopyrightText: 2026 Shaan Narendran
 // SPDX-FileCopyrightText: 2026 Kaushik Kumar
 // SPDX-FileCopyrightText: 2026 Lokesh
 // SPDX-FileCopyrightText: 2026 Srihari
 // SPDX-FileCopyrightText: 2026 VishnuM449
 // SPDX-License-Identifier: Apache-2.0
 
-import type { EventId, JsonObject, OperationId, SessionId } from "./event-envelope.ts";
+import type { EventId, JsonObject, JsonValue, OperationId, SessionId } from "./event-envelope.ts";
 import {
   ProtocolValidationError,
   parseEventId,
   parseOperationId,
   parseSessionId,
 } from "./event-envelope.ts";
+import {
+  type ExtensionCommandInvokeParams,
+  type ExtensionCommandInvokeResult,
+  type ExtensionIdParams,
+  type ExtensionInstallParams,
+  type ExtensionListParams,
+  type ExtensionListResult,
+  type ExtensionMutationResult,
+  type ExtensionReloadParams,
+  type ExtensionTrustParams,
+  parseExtensionCommandInvokeParams,
+  parseExtensionCommandInvokeResult,
+  parseExtensionIdParams,
+  parseExtensionInstallParams,
+  parseExtensionListParams,
+  parseExtensionListResult,
+  parseExtensionMutationResult,
+  parseExtensionTrustParams,
+} from "./extension-management.ts";
 import type {
   AssistantStopReason,
   BlobReference,
@@ -23,6 +43,21 @@ import type {
   UserContent,
 } from "./events.ts";
 import { parseBlobReference, parseEvent, parseUserContent } from "./events.ts";
+import {
+  type McpConfigBatchParams,
+  type McpConfigListResult,
+  type McpConfigMutationResult,
+  type McpConfigProbeParams,
+  type McpConfigProbeResult,
+  type McpConfigRemoveParams,
+  type McpConfigUpsertParams,
+  parseMcpConfigBatchParams,
+  parseMcpConfigListResult,
+  parseMcpConfigMutationResult,
+  parseMcpConfigProbeResult,
+  parseMcpServerDefinition,
+  parseMcpServerName,
+} from "./mcp-configuration.ts";
 import { type ModelRequestSettings, parseModelRequestSettings } from "./model-request.ts";
 import {
   isProviderRpcErrorCode,
@@ -60,6 +95,7 @@ export interface SessionModelSelection {
 export interface SessionToolSelection {
   readonly webFetch?: boolean;
   readonly webSearch?: boolean;
+  readonly userQuestions?: boolean;
 }
 
 export type SessionSelection = SessionModelSelection & SessionToolSelection;
@@ -94,6 +130,7 @@ export interface SessionSummary {
   readonly sandboxImage?: string;
   readonly runtime: SessionOpenResult["runtime"];
   readonly attachmentCount: number;
+  readonly profile?: SessionProfile;
 }
 
 export interface SessionListParams {
@@ -128,6 +165,14 @@ export type SessionActivityFrame =
       readonly sequence: number;
       readonly type: "tool_call";
       readonly call: TransientToolCall;
+    }
+  | {
+      readonly operationId: OperationId;
+      readonly sequence: number;
+      readonly type: "tool_progress";
+      readonly callId: string;
+      readonly name: string;
+      readonly progress: JsonValue;
     }
   | {
       readonly operationId: OperationId;
@@ -671,6 +716,20 @@ export const WIRE_CAPABILITIES = [
   "provider.auth.status",
   "provider.auth.login",
   "provider.auth.logout",
+  "extension.list",
+  "extension.enable",
+  "extension.disable",
+  "extension.reload",
+  "extension.install",
+  "extension.update",
+  "extension.remove",
+  "extension.trust",
+  "extension.command.invoke",
+  "mcp.config.list",
+  "mcp.config.upsert",
+  "mcp.config.batch",
+  "mcp.config.remove",
+  "mcp.config.probe",
 ] as const satisfies readonly CapabilityId[];
 
 export interface ClientIdentity {
@@ -783,6 +842,62 @@ export interface RpcMethodMap {
     readonly params: ProviderLogoutParams;
     readonly result: ProviderLogoutResult;
   };
+  readonly "extension.list": {
+    readonly params: ExtensionListParams;
+    readonly result: ExtensionListResult;
+  };
+  readonly "extension.enable": {
+    readonly params: ExtensionIdParams;
+    readonly result: ExtensionMutationResult;
+  };
+  readonly "extension.disable": {
+    readonly params: ExtensionIdParams;
+    readonly result: ExtensionMutationResult;
+  };
+  readonly "extension.reload": {
+    readonly params: ExtensionReloadParams;
+    readonly result: ExtensionMutationResult;
+  };
+  readonly "extension.install": {
+    readonly params: ExtensionInstallParams;
+    readonly result: ExtensionMutationResult;
+  };
+  readonly "extension.update": {
+    readonly params: ExtensionIdParams;
+    readonly result: ExtensionMutationResult;
+  };
+  readonly "extension.remove": {
+    readonly params: ExtensionIdParams;
+    readonly result: ExtensionMutationResult;
+  };
+  readonly "extension.trust": {
+    readonly params: ExtensionTrustParams;
+    readonly result: ExtensionMutationResult;
+  };
+  readonly "extension.command.invoke": {
+    readonly params: ExtensionCommandInvokeParams;
+    readonly result: ExtensionCommandInvokeResult;
+  };
+  readonly "mcp.config.list": {
+    readonly params: Record<string, never>;
+    readonly result: McpConfigListResult;
+  };
+  readonly "mcp.config.upsert": {
+    readonly params: McpConfigUpsertParams;
+    readonly result: McpConfigMutationResult;
+  };
+  readonly "mcp.config.batch": {
+    readonly params: McpConfigBatchParams;
+    readonly result: McpConfigMutationResult;
+  };
+  readonly "mcp.config.remove": {
+    readonly params: McpConfigRemoveParams;
+    readonly result: McpConfigMutationResult;
+  };
+  readonly "mcp.config.probe": {
+    readonly params: McpConfigProbeParams;
+    readonly result: McpConfigProbeResult;
+  };
   readonly "session.create": {
     readonly params: { readonly cwd: string } & SessionConfiguration;
     readonly result: SessionOpenResult;
@@ -865,7 +980,11 @@ export interface RpcMethodMap {
   };
   readonly "session.compact": {
     readonly params: { readonly sessionId: SessionId; readonly instructions?: string };
-    readonly result: { readonly eventId: EventId };
+    readonly result: {
+      readonly state: "completed" | "queued";
+      readonly operationId: OperationId;
+      readonly eventId: EventId;
+    };
   };
   readonly "session.queue.enqueue": {
     readonly params: {
@@ -919,6 +1038,7 @@ export interface RpcMethodMap {
       readonly profile: SessionProfile;
       readonly webFetch: boolean;
       readonly webSearch: boolean;
+      readonly userQuestions: boolean;
       readonly boundaryEventIds: readonly EventId[];
     };
   };
@@ -1000,6 +1120,13 @@ export type RpcMethod = keyof RpcMethodMap;
 export type RpcParams<Method extends RpcMethod> = RpcMethodMap[Method]["params"];
 
 export const RETRYABLE_MUTATION_METHODS = [
+  "extension.enable",
+  "extension.disable",
+  "extension.reload",
+  "extension.install",
+  "extension.update",
+  "extension.remove",
+  "extension.trust",
   "session.create",
   "session.fork",
   "session.clone",
@@ -1008,6 +1135,7 @@ export const RETRYABLE_MUTATION_METHODS = [
   "session.import",
   "session.send",
   "session.interruptAndDeliver",
+  "session.compact",
   "session.queue.enqueue",
   "session.queue.requeue",
   "session.queue.restore",
@@ -1091,6 +1219,7 @@ export const RPC_ERROR_CODES = [
   "empty_session",
   "unknown_interaction",
   "interaction_already_resolved",
+  "invalid_interaction_response",
   "unknown_subscription",
   "unknown_cursor",
   "snapshot_required",
@@ -1144,6 +1273,9 @@ export const RPC_ERROR_CODES = [
   "region_required",
   "region_unsupported",
   "provider_configuration_required",
+  "mcp_probe_failed",
+  "command_blocked",
+  "extension_failed",
 ] as const;
 
 export type RpcErrorCode = (typeof RPC_ERROR_CODES)[number] | (string & {});
@@ -1448,6 +1580,24 @@ export function parseSessionActivityFrame(value: unknown): SessionActivityFrame 
       call: parseTransientToolCall(frame.call, "activity.frame.call"),
     };
   }
+  if (frame.type === "tool_progress") {
+    exact(frame, "activity.frame", [
+      "operationId",
+      "sequence",
+      "type",
+      "callId",
+      "name",
+      "progress",
+    ]);
+    return {
+      operationId,
+      sequence,
+      type: frame.type,
+      callId: boundedString(frame.callId, "activity.frame.callId", 256),
+      name: boundedString(frame.name, "activity.frame.name", 256),
+      progress: frame.progress as JsonValue,
+    };
+  }
   if (frame.type === "snapshot") {
     exact(frame, "activity.frame", [
       "operationId",
@@ -1480,7 +1630,7 @@ export function parseSessionActivityFrame(value: unknown): SessionActivityFrame 
   }
   throw new ProtocolValidationError(
     "activity.frame.type",
-    "must be text_delta, thinking_delta, tool_call, snapshot, or clear",
+    "must be text_delta, thinking_delta, tool_call, tool_progress, snapshot, or clear",
   );
 }
 
@@ -1514,7 +1664,7 @@ function selection(params: Record<string, unknown>, path: string): SessionSelect
       `must be one of: ${thinkingLevels.join(", ")}`,
     );
   }
-  for (const field of ["webFetch", "webSearch"] as const) {
+  for (const field of ["webFetch", "webSearch", "userQuestions"] as const) {
     if (params[field] !== undefined && typeof params[field] !== "boolean") {
       throw new ProtocolValidationError(`${path}.${field}`, "must be a boolean");
     }
@@ -1533,7 +1683,45 @@ function selection(params: Record<string, unknown>, path: string): SessionSelect
     ...(thinkingLevel === undefined ? {} : { thinkingLevel: thinkingLevel as ThinkingLevel }),
     ...(params.webFetch === undefined ? {} : { webFetch: params.webFetch as boolean }),
     ...(params.webSearch === undefined ? {} : { webSearch: params.webSearch as boolean }),
+    ...(params.userQuestions === undefined
+      ? {}
+      : { userQuestions: params.userQuestions as boolean }),
   };
+}
+
+const SESSION_CONFIGURATION_FIELDS = [
+  "providerId",
+  "modelId",
+  "thinkingLevel",
+  "requestSettings",
+  "webFetch",
+  "webSearch",
+  "userQuestions",
+  "profile",
+] as const;
+
+/** Validates a session configuration update. Extra keys other than `sessionId` are rejected. */
+export function parseSessionConfiguration(value: unknown, path: string): SessionConfiguration {
+  const params = object(value, path);
+  exact(params, path, ["sessionId", ...SESSION_CONFIGURATION_FIELDS]);
+  const configured = selection(params, path);
+  const profile = sessionProfile(params.profile, `${path}.profile`);
+  if (
+    configured.providerId === undefined &&
+    configured.requestSettings === undefined &&
+    configured.modelId === undefined &&
+    configured.thinkingLevel === undefined &&
+    configured.webFetch === undefined &&
+    configured.webSearch === undefined &&
+    configured.userQuestions === undefined &&
+    profile === undefined
+  ) {
+    throw new ProtocolValidationError(
+      path,
+      "must include providerId, modelId, thinkingLevel, requestSettings, webFetch, webSearch, userQuestions, or profile",
+    );
+  }
+  return { ...configured, ...(profile === undefined ? {} : { profile }) };
 }
 
 export function parseWireRequest(value: unknown): WireRequest {
@@ -1643,6 +1831,64 @@ export function parseWireRequest(value: unknown): WireRequest {
       params: { providerId: parseProviderIdParam(params.providerId, "request.params.providerId") },
     };
   }
+  if (method === "extension.list") {
+    return { ...base, method, params: parseExtensionListParams(params) };
+  }
+  if (
+    method === "extension.enable" ||
+    method === "extension.disable" ||
+    method === "extension.reload" ||
+    method === "extension.update" ||
+    method === "extension.remove"
+  ) {
+    return { ...base, method, params: parseExtensionIdParams(params) };
+  }
+  if (method === "extension.install") {
+    return { ...base, method, params: parseExtensionInstallParams(params) };
+  }
+  if (method === "extension.trust") {
+    return { ...base, method, params: parseExtensionTrustParams(params) };
+  }
+  if (method === "extension.command.invoke") {
+    return { ...base, method, params: parseExtensionCommandInvokeParams(params) };
+  }
+  if (method === "mcp.config.list") {
+    exact(params, "request.params", []);
+    return { ...base, method, params: {} };
+  }
+  if (method === "mcp.config.upsert") {
+    exact(params, "request.params", ["name", "definition"]);
+    return {
+      ...base,
+      method,
+      params: {
+        name: parseMcpServerName(params.name, "request.params.name"),
+        definition: parseMcpServerDefinition(params.definition, "request.params.definition"),
+      },
+    };
+  }
+  if (method === "mcp.config.batch") {
+    return { ...base, method, params: parseMcpConfigBatchParams(params) };
+  }
+  if (method === "mcp.config.remove") {
+    exact(params, "request.params", ["name"]);
+    return {
+      ...base,
+      method,
+      params: { name: parseMcpServerName(params.name, "request.params.name") },
+    };
+  }
+  if (method === "mcp.config.probe") {
+    exact(params, "request.params", ["name", "definition"]);
+    return {
+      ...base,
+      method,
+      params: {
+        name: parseMcpServerName(params.name, "request.params.name"),
+        definition: parseMcpServerDefinition(params.definition, "request.params.definition"),
+      },
+    };
+  }
   if (method === "session.create") {
     exact(params, "request.params", [
       "cwd",
@@ -1652,6 +1898,7 @@ export function parseWireRequest(value: unknown): WireRequest {
       "requestSettings",
       "webFetch",
       "webSearch",
+      "userQuestions",
       "profile",
     ]);
     const profile = sessionProfile(params.profile, "request.params.profile");
@@ -1921,39 +2168,13 @@ export function parseWireRequest(value: unknown): WireRequest {
     };
   }
   if (method === "session.configure") {
-    exact(params, "request.params", [
-      "sessionId",
-      "providerId",
-      "modelId",
-      "thinkingLevel",
-      "requestSettings",
-      "webFetch",
-      "webSearch",
-      "profile",
-    ]);
-    const configured = selection(params, "request.params");
-    const profile = sessionProfile(params.profile, "request.params.profile");
-    if (
-      configured.providerId === undefined &&
-      configured.requestSettings === undefined &&
-      configured.modelId === undefined &&
-      configured.thinkingLevel === undefined &&
-      configured.webFetch === undefined &&
-      configured.webSearch === undefined &&
-      profile === undefined
-    ) {
-      throw new ProtocolValidationError(
-        "request.params",
-        "must include providerId, modelId, thinkingLevel, requestSettings, webFetch, webSearch, or profile",
-      );
-    }
+    exact(params, "request.params", ["sessionId", ...SESSION_CONFIGURATION_FIELDS]);
     return {
       ...base,
       method,
       params: {
         sessionId: parseSessionId(params.sessionId, "request.params.sessionId"),
-        ...configured,
-        ...(profile === undefined ? {} : { profile }),
+        ...parseSessionConfiguration(params, "request.params"),
       },
     };
   }
@@ -2275,6 +2496,7 @@ function parseSessionSummary(value: unknown, path: string): SessionSummary {
     "sandboxImage",
     "runtime",
     "attachmentCount",
+    "profile",
   ]);
   if (
     summary.securityMode !== undefined &&
@@ -2283,6 +2505,7 @@ function parseSessionSummary(value: unknown, path: string): SessionSummary {
   ) {
     throw new ProtocolValidationError(`${path}.securityMode`, "must be sandboxed or unsafe");
   }
+  const profile = sessionProfile(summary.profile, `${path}.profile`);
   return {
     sessionId: parseSessionId(summary.sessionId, `${path}.sessionId`),
     cwd: string(summary.cwd, `${path}.cwd`),
@@ -2312,6 +2535,7 @@ function parseSessionSummary(value: unknown, path: string): SessionSummary {
       : { sandboxImage: boundedString(summary.sandboxImage, `${path}.sandboxImage`, 1024) }),
     runtime: parseSessionRuntime(summary.runtime, `${path}.runtime`),
     attachmentCount: nonNegativeInteger(summary.attachmentCount, `${path}.attachmentCount`),
+    ...(profile === undefined ? {} : { profile }),
   };
 }
 
@@ -2548,6 +2772,30 @@ export function parseRpcResult<Method extends RpcMethod>(
     parsed = parseProviderAuthenticationStatusResult(value);
   } else if (method === "provider.auth.login" || method === "provider.auth.logout") {
     parsed = parseProviderAuthenticationStatus(value, path);
+  } else if (method === "extension.list") {
+    parsed = parseExtensionListResult(value);
+  } else if (method === "extension.command.invoke") {
+    parsed = parseExtensionCommandInvokeResult(value);
+  } else if (
+    method === "extension.enable" ||
+    method === "extension.disable" ||
+    method === "extension.reload" ||
+    method === "extension.install" ||
+    method === "extension.update" ||
+    method === "extension.remove" ||
+    method === "extension.trust"
+  ) {
+    parsed = parseExtensionMutationResult(value);
+  } else if (method === "mcp.config.list") {
+    parsed = parseMcpConfigListResult(value);
+  } else if (
+    method === "mcp.config.upsert" ||
+    method === "mcp.config.batch" ||
+    method === "mcp.config.remove"
+  ) {
+    parsed = parseMcpConfigMutationResult(value);
+  } else if (method === "mcp.config.probe") {
+    parsed = parseMcpConfigProbeResult(value);
   } else if (method === "session.create" || method === "session.resume") {
     parsed = parseSessionOpenResult(value, path);
   } else if (method === "session.list") {
@@ -2664,8 +2912,15 @@ export function parseRpcResult<Method extends RpcMethod>(
     };
   } else if (method === "session.compact") {
     const result = object(value, path);
-    exact(result, path, ["eventId"]);
-    parsed = { eventId: parseEventId(result.eventId, `${path}.eventId`) };
+    exact(result, path, ["state", "operationId", "eventId"]);
+    if (result.state !== "completed" && result.state !== "queued") {
+      throw new ProtocolValidationError(`${path}.state`, "must be completed or queued");
+    }
+    parsed = {
+      state: result.state,
+      operationId: parseOperationId(result.operationId, `${path}.operationId`),
+      eventId: parseEventId(result.eventId, `${path}.eventId`),
+    };
   } else if (method === "session.queue.enqueue" || method === "session.queue.requeue") {
     const result = object(value, path);
     exact(result, path, ["queueItemId", "state"]);
@@ -2760,6 +3015,7 @@ export function parseRpcResult<Method extends RpcMethod>(
       "profile",
       "webFetch",
       "webSearch",
+      "userQuestions",
       "boundaryEventIds",
     ]);
     if (!thinkingLevels.includes(result.requestedThinkingLevel as ThinkingLevel)) {
@@ -2779,6 +3035,9 @@ export function parseRpcResult<Method extends RpcMethod>(
         throw new ProtocolValidationError(`${path}.${field}`, "must be a boolean");
       }
     }
+    if (result.userQuestions !== undefined && typeof result.userQuestions !== "boolean") {
+      throw new ProtocolValidationError(`${path}.userQuestions`, "must be a boolean");
+    }
     if (!Array.isArray(result.boundaryEventIds) || result.boundaryEventIds.length > 256) {
       throw new ProtocolValidationError(`${path}.boundaryEventIds`, "must contain at most 256 IDs");
     }
@@ -2795,6 +3054,7 @@ export function parseRpcResult<Method extends RpcMethod>(
       profile,
       webFetch: result.webFetch,
       webSearch: result.webSearch,
+      userQuestions: result.userQuestions ?? false,
       boundaryEventIds: result.boundaryEventIds.map((id, index) =>
         parseEventId(id, `${path}.boundaryEventIds[${index}]`),
       ),
@@ -2939,6 +3199,20 @@ export const RPC_METHODS = [
   "provider.auth.status",
   "provider.auth.login",
   "provider.auth.logout",
+  "extension.list",
+  "extension.enable",
+  "extension.disable",
+  "extension.reload",
+  "extension.install",
+  "extension.update",
+  "extension.remove",
+  "extension.trust",
+  "extension.command.invoke",
+  "mcp.config.list",
+  "mcp.config.upsert",
+  "mcp.config.batch",
+  "mcp.config.remove",
+  "mcp.config.probe",
   "session.create",
   "session.resume",
   "session.list",
@@ -2997,6 +3271,7 @@ export const UNIVERSAL_RPC_ERROR_CODES = [
 ] as const satisfies readonly KnownRpcErrorCode[];
 
 const SESSION_BASE_ERRORS = ["unknown_session", "event_migration_required"] as const;
+const EXTENSION_ERRORS = ["extension_failed"] as const;
 const MUTATION_ERRORS = ["invalid_idempotency_key", "idempotency_conflict"] as const;
 const WORKSPACE_BASE_ERRORS = [
   ...SESSION_BASE_ERRORS,
@@ -3059,6 +3334,20 @@ export const RPC_METHOD_ERROR_CODES = {
     "authentication_unavailable",
     "authentication_failed",
   ],
+  "extension.list": ["unknown_session", "extension_failed"],
+  "extension.enable": ["unknown_session", "operation_active", "extension_failed"],
+  "extension.disable": ["unknown_session", "operation_active", "extension_failed"],
+  "extension.reload": ["unknown_session", "operation_active", "extension_failed"],
+  "extension.install": ["unknown_session", "operation_active", "extension_failed"],
+  "extension.update": ["unknown_session", "operation_active", "extension_failed"],
+  "extension.remove": ["unknown_session", "operation_active", "extension_failed"],
+  "extension.trust": ["unknown_session", "operation_active", "extension_failed"],
+  "extension.command.invoke": ["unknown_session", "operation_active", "extension_failed"],
+  "mcp.config.list": [],
+  "mcp.config.upsert": [],
+  "mcp.config.batch": [],
+  "mcp.config.remove": [],
+  "mcp.config.probe": ["mcp_probe_failed"],
   "session.create": [
     "invalid_cwd",
     ...MUTATION_ERRORS,
@@ -3068,6 +3357,7 @@ export const RPC_METHOD_ERROR_CODES = {
     "provider_disabled",
     "model_not_found",
     "model_unavailable",
+    "catalog_refresh_failed",
     "authentication_required",
     "authentication_failed",
     "entitlement_required",
@@ -3075,6 +3365,7 @@ export const RPC_METHOD_ERROR_CODES = {
     "region_required",
     "region_unsupported",
     "provider_configuration_required",
+    ...EXTENSION_ERRORS,
   ],
   "session.resume": [
     "unknown_session",
@@ -3084,6 +3375,7 @@ export const RPC_METHOD_ERROR_CODES = {
     "provider_disabled",
     "model_not_found",
     "model_unavailable",
+    "catalog_refresh_failed",
     "authentication_required",
     "authentication_failed",
     "entitlement_required",
@@ -3091,6 +3383,7 @@ export const RPC_METHOD_ERROR_CODES = {
     "region_required",
     "region_unsupported",
     "provider_configuration_required",
+    ...EXTENSION_ERRORS,
   ],
   "session.list": ["invalid_cwd", "unknown_cursor"],
   "session.history": ["unknown_cursor", "snapshot_required", "event_migration_required"],
@@ -3103,6 +3396,8 @@ export const RPC_METHOD_ERROR_CODES = {
     "invalid_fork_point",
     ...MUTATION_ERRORS,
     "content_too_large",
+    "command_blocked",
+    ...EXTENSION_ERRORS,
   ],
   "session.clone": [
     ...SESSION_BASE_ERRORS,
@@ -3111,12 +3406,15 @@ export const RPC_METHOD_ERROR_CODES = {
     "empty_session",
     ...MUTATION_ERRORS,
     "content_too_large",
+    "command_blocked",
+    ...EXTENSION_ERRORS,
   ],
   "session.rename": [
     ...SESSION_BASE_ERRORS,
     "operation_active",
     ...MUTATION_ERRORS,
     "content_too_large",
+    "command_blocked",
   ],
   "session.delete": [...SESSION_BASE_ERRORS, "operation_active", ...MUTATION_ERRORS],
   "session.export": [
@@ -3146,6 +3444,7 @@ export const RPC_METHOD_ERROR_CODES = {
     "blob_missing",
     "blob_corrupt",
     "content_too_large",
+    ...EXTENSION_ERRORS,
   ],
   "session.steer": [
     ...SESSION_BASE_ERRORS,
@@ -3153,6 +3452,7 @@ export const RPC_METHOD_ERROR_CODES = {
     "blob_not_owned",
     "blob_missing",
     "blob_corrupt",
+    ...EXTENSION_ERRORS,
   ],
   "session.followUp": [
     ...SESSION_BASE_ERRORS,
@@ -3160,6 +3460,7 @@ export const RPC_METHOD_ERROR_CODES = {
     "blob_not_owned",
     "blob_missing",
     "blob_corrupt",
+    ...EXTENSION_ERRORS,
   ],
   "session.interruptAndDeliver": [
     ...SESSION_BASE_ERRORS,
@@ -3169,8 +3470,15 @@ export const RPC_METHOD_ERROR_CODES = {
     "blob_missing",
     "blob_corrupt",
     "content_too_large",
+    ...EXTENSION_ERRORS,
   ],
-  "session.compact": [...SESSION_BASE_ERRORS, "operation_active", "content_too_large"],
+  "session.compact": [
+    ...SESSION_BASE_ERRORS,
+    "operation_active",
+    ...MUTATION_ERRORS,
+    "content_too_large",
+    "command_blocked",
+  ],
   "session.queue.enqueue": [
     ...SESSION_BASE_ERRORS,
     ...MUTATION_ERRORS,
@@ -3191,6 +3499,7 @@ export const RPC_METHOD_ERROR_CODES = {
     ...SESSION_BASE_ERRORS,
     "operation_active",
     "idempotency_conflict",
+    "command_blocked",
     "content_too_large",
   ],
   "session.interrupt": [...SESSION_BASE_ERRORS, ...MUTATION_ERRORS],
@@ -3211,6 +3520,8 @@ export const RPC_METHOD_ERROR_CODES = {
     "region_required",
     "region_unsupported",
     "provider_configuration_required",
+    "command_blocked",
+    ...EXTENSION_ERRORS,
   ],
   "session.configure": [
     ...SESSION_BASE_ERRORS,
@@ -3229,11 +3540,14 @@ export const RPC_METHOD_ERROR_CODES = {
     "region_required",
     "region_unsupported",
     "provider_configuration_required",
+    "command_blocked",
+    ...EXTENSION_ERRORS,
   ],
   "session.interaction.respond": [
     ...SESSION_BASE_ERRORS,
     "unknown_interaction",
     "interaction_already_resolved",
+    "invalid_interaction_response",
     ...MUTATION_ERRORS,
     "content_too_large",
   ],

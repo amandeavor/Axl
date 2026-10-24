@@ -9,8 +9,10 @@ import { dirname } from "node:path";
 
 import { THINKING_LEVELS } from "@axl/ai/models";
 import {
+  type CompactionPreferences,
   type ThinkingLevel,
   type ModelRequestSettings,
+  parseCompactionPreferences,
   parseModelRequestSettings,
 } from "@axl/protocol";
 
@@ -28,6 +30,7 @@ export interface AxlSettings {
 
 export interface TuiSettings {
   readonly requestSettings?: ModelRequestSettings;
+  readonly compaction?: CompactionPreferences;
   readonly version: 1;
   readonly providerId?: string;
   readonly modelId?: string;
@@ -49,6 +52,9 @@ export interface TuiSettings {
   readonly diffLayout?: "unified" | "split";
   readonly workspaceReview?: boolean;
   readonly imageDisplay?: ImageDisplay;
+  readonly loungeEnabled?: boolean;
+  readonly mascot?: boolean;
+  readonly mascotColour?: string;
 }
 
 const EMPTY_SETTINGS: TuiSettings = { version: 1 };
@@ -96,6 +102,7 @@ function parseSettings(value: unknown, path: string): TuiSettings {
     "modelId",
     "thinkingLevel",
     "requestSettings",
+    "compaction",
     "theme",
     "webFetch",
     "webSearch",
@@ -113,12 +120,17 @@ function parseSettings(value: unknown, path: string): TuiSettings {
     "diffLayout",
     "workspaceReview",
     "imageDisplay",
+    "loungeEnabled",
+    "mascot",
+    "mascotColour",
   ]);
   for (const key of Object.keys(input)) {
     if (!allowed.has(key)) throw new Error(`${path}: unknown setting ${key}`);
   }
   if (input.requestSettings !== undefined)
     parseModelRequestSettings(input.requestSettings, `${path}.requestSettings`);
+  if (input.compaction !== undefined)
+    parseCompactionPreferences(input.compaction, `${path}.compaction`);
   if (input.version !== 1) throw new Error(`${path}: version must be 1`);
   for (const field of ["providerId", "modelId"] as const) {
     if (input[field] !== undefined && (typeof input[field] !== "string" || !input[field])) {
@@ -213,6 +225,18 @@ function parseSettings(value: unknown, path: string): TuiSettings {
   }
   if (input.workspaceReview !== undefined && typeof input.workspaceReview !== "boolean") {
     throw new Error(`${path}: workspaceReview must be a boolean`);
+  }
+  if (input.loungeEnabled !== undefined && typeof input.loungeEnabled !== "boolean") {
+    throw new Error(`${path}: loungeEnabled must be a boolean`);
+  }
+  if (input.mascot !== undefined && typeof input.mascot !== "boolean") {
+    throw new Error(`${path}: mascot must be a boolean`);
+  }
+  if (
+    input.mascotColour !== undefined &&
+    (typeof input.mascotColour !== "string" || !/^[A-Za-z_]+$/.test(input.mascotColour))
+  ) {
+    throw new Error(`${path}: invalid mascotColour`);
   }
   if (
     input.imageDisplay !== undefined &&

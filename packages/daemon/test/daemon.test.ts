@@ -3,6 +3,7 @@
 // SPDX-FileCopyrightText: 2026 Lokesh
 // SPDX-FileCopyrightText: 2026 Srihari
 // SPDX-FileCopyrightText: 2026 VishnuM449
+// SPDX-FileCopyrightText: 2026 Shaan Narendran
 // SPDX-License-Identifier: Apache-2.0
 
 import assert from "node:assert/strict";
@@ -16,6 +17,7 @@ import {
   realpath,
   rename,
   rm,
+  stat,
   symlink,
   truncate,
   writeFile,
@@ -27,7 +29,16 @@ import { StringDecoder } from "node:string_decoder";
 import test, { type TestContext } from "node:test";
 import { promisify } from "node:util";
 
-import { JsonlEventLog, type ModelPort, type ModelRetryOptions, ToolRegistry } from "@axl/kernel";
+import {
+  buildStablePrompt,
+  type CompactionSettings,
+  type ExtensionHost,
+  ExtensionHostError,
+  JsonlEventLog,
+  type ModelPort,
+  type ModelRetryOptions,
+  ToolRegistry,
+} from "@axl/kernel";
 import type {
   BlobReference,
   CanonicalEvent,
@@ -65,7 +76,15 @@ import {
 } from "@axl/sdk";
 import { connectUnixClient, nodeIdempotencyKeys, UnixSocketTransportFactory } from "@axl/sdk/unix";
 import { CommandJournal, CommandJournalError } from "../src/command-journal.ts";
-import { AxlDaemon, DaemonError, normalizeDaemonRpcErrorCode } from "../src/index.ts";
+import {
+  AxlDaemon,
+  commandCatalog,
+  DaemonError,
+  type ExtensionManagementService,
+  installDaemonCommandCapabilities,
+  type McpConfigurationService,
+  normalizeDaemonRpcErrorCode,
+} from "../src/index.ts";
 import { decodeGit, GitExecutionError, runGit } from "../src/workspace-git.ts";
 
 const usage: Usage = { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 };
@@ -143,7 +162,12 @@ async function startDaemon(
   deliveryOptions: {
     readonly cursorLifetimeMs?: number;
     readonly retry?: ModelRetryOptions | false;
+    readonly compaction?: Partial<CompactionSettings>;
+    readonly modelContextWindow?: number;
     readonly tools?: (sessionId: SessionId, dataDirectory: string) => ToolRegistry;
+    readonly extensionHost?: ExtensionHost;
+    readonly mcpConfiguration?: McpConfigurationService;
+    readonly extensionManagement?: ExtensionManagementService;
   } = {},
 ): Promise<{ daemon: AxlDaemon; socketPath: string; dataDirectory: string; cwd: string }> {
   const directory = await mkdtemp(join(tmpdir(), "axl-daemon-"));
@@ -151,7 +175,8 @@ async function startDaemon(
   const cwd = await realpath(directory);
   const socketPath = join(directory, "axl.sock");
   const dataDirectory = join(directory, "data");
-  const { retry, tools, ...daemonOptions } = deliveryOptions;
+  const { retry, compaction, modelContextWindow, tools, extensionHost, ...daemonOptions } =
+    deliveryOptions;
   const daemon = new AxlDaemon({
     socketPath,
     dataDirectory,
@@ -164,6 +189,9 @@ async function startDaemon(
       tools: tools?.(sessionId, dataDirectory) ?? new ToolRegistry(),
       system: "You are Axl.",
       ...(retry === undefined ? {} : { retry }),
+      ...(compaction === undefined ? {} : { compaction }),
+      ...(modelContextWindow === undefined ? {} : { modelContextWindow }),
+      ...(extensionHost === undefined ? {} : { extensionHost }),
     }),
   });
   await daemon.start();
@@ -368,6 +396,26 @@ test("the daemon response boundary enforces every method's allowed-error matrix"
   }
 });
 
+test("session listing skips a reserved log whose creation never committed", async (context) => {
+  const fixture = await startDaemon(context);
+  const client = await connectUnixClient(fixture.socketPath);
+  context.after(() => client.close());
+  const created = await client.request("session.create", { cwd: fixture.cwd });
+  await writeFile(join(fixture.dataDirectory, "sessions", `${randomUUID()}.jsonl`), "", {
+    mode: 0o600,
+  });
+
+  const listed = await client.request("session.list", {
+    scope: "all_local",
+    order: "recent",
+    pageSize: 100,
+  });
+  assert.deepEqual(
+    listed.sessions.map((session) => session.sessionId),
+    [created.sessionId],
+  );
+});
+
 test("internal RPC failures do not expose subsystem messages", async (context) => {
   const fixture = await startDaemon(context);
   const client = await connectUnixClient(fixture.socketPath);
@@ -389,6 +437,42 @@ test("internal RPC failures do not expose subsystem messages", async (context) =
       error.message === "Request failed" &&
       !error.message.includes(fixture.dataDirectory),
   );
+  // The actionable detail stays in the private daemon log instead of being discarded.
+  const logPath = join(fixture.dataDirectory, "daemon.log");
+  let logged = "";
+  for (let attempt = 0; attempt < 50 && !logged.includes(sensitiveMessage); attempt += 1) {
+    logged = await readFile(logPath, "utf8").catch(() => "");
+    if (!logged.includes(sensitiveMessage)) await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.match(logged, /internal_error session\.workspace\.status: Error: ENOENT/u);
+  assert.ok(logged.includes(sensitiveMessage));
+  assert.equal((await stat(logPath)).mode & 0o777, 0o600);
+});
+
+test("returns actionable extension failures without exposing unrelated internals", async (context) => {
+  const fixture = await startDaemon(context, replyPort(), "sandboxed", undefined, undefined, {
+    extensionHost: {
+      activate: () => {
+        throw new ExtensionHostError("/home/user/.axl/extensions/broken.ts: factory failed", {
+          extensionId: "broken",
+          path: "/home/user/.axl/extensions/broken.ts",
+          phase: "activate",
+        });
+      },
+      dispose: () => undefined,
+    },
+  });
+  const client = await connectUnixClient(fixture.socketPath);
+  context.after(() => client.close());
+  await assert.rejects(client.request("session.create", { cwd: fixture.cwd }), (error) => {
+    assert.ok(error instanceof AxlClientError);
+    assert.equal(error.code, "extension_failed");
+    assert.match(error.message, /broken\.ts: factory failed/);
+    assert.equal(error.details?.extensionId, "broken");
+    assert.equal(error.details.path, "/home/user/.axl/extensions/broken.ts");
+    assert.equal(error.details.phase, "activate");
+    return true;
+  });
 });
 
 test("requires current-version initialization before session access", async (context) => {
@@ -576,6 +660,127 @@ test("cancels attachment-owned read requests without cancelling session operatio
   );
 });
 
+test("cancels an in-flight MCP probe", async (context) => {
+  let started!: () => void;
+  const probeStarted = new Promise<void>((resolvePromise) => {
+    started = resolvePromise;
+  });
+  const empty = { path: "/tmp/mcp.json", servers: [], changed: false } as const;
+  const fixture = await startDaemon(context, replyPort(), "sandboxed", undefined, undefined, {
+    mcpConfiguration: {
+      list: async () => empty,
+      upsert: async () => empty,
+      batch: async () => empty,
+      remove: async () => empty,
+      probe: async (_params, signal) => {
+        started();
+        await new Promise<void>((_resolve, reject) => {
+          signal?.addEventListener(
+            "abort",
+            () => reject(new DOMException("Aborted", "AbortError")),
+            { once: true },
+          );
+        });
+        throw new Error("unreachable");
+      },
+    },
+  });
+  const client = await connectUnixClient(fixture.socketPath);
+  context.after(() => client.close());
+  const controller = new AbortController();
+  const pending = client.probeMcpServer(
+    { name: "docs", definition: { url: "https://mcp.example.com/mcp" } },
+    { signal: controller.signal },
+  );
+  await probeStarted;
+  controller.abort();
+  await assert.rejects(
+    pending,
+    (error) => error instanceof AxlClientError && error.code === "cancelled",
+  );
+});
+
+test("forwards cancellation through journaled extension mutations", async (context) => {
+  let started!: () => void;
+  const operationStarted = new Promise<void>((resolvePromise) => {
+    started = resolvePromise;
+  });
+  const fixture = await startDaemon(context, replyPort(), "sandboxed", undefined, undefined, {
+    extensionManagement: {
+      list: async (cwd) => ({
+        configPath: "/tmp/extensions.json",
+        project: { root: cwd, trusted: false },
+        extensions: [],
+        commands: [],
+      }),
+      setEnabled: async () => undefined,
+      install: async (_source, signal) => {
+        started();
+        await new Promise<void>((_resolve, reject) => {
+          signal?.addEventListener(
+            "abort",
+            () => reject(new DOMException("Aborted", "AbortError")),
+            { once: true },
+          );
+        });
+        throw new Error("unreachable");
+      },
+      update: async () => undefined,
+      remove: async () => undefined,
+      trustProject: async () => undefined,
+    },
+  });
+  const client = await connectUnixClient(fixture.socketPath);
+  context.after(() => client.close());
+  const created = await client.request("session.create", { cwd: fixture.cwd });
+  const controller = new AbortController();
+  const pending = client.installExtension(
+    { sessionId: created.sessionId, source: { type: "npm", spec: "example" } },
+    { signal: controller.signal },
+  );
+  await operationStarted;
+  controller.abort();
+  await assert.rejects(
+    pending,
+    (error) => error instanceof AxlClientError && error.code === "cancelled",
+  );
+});
+
+test("session.list reports the configured profile for each session", async (context) => {
+  const directory = await mkdtemp(join(tmpdir(), "axl-daemon-"));
+  context.after(() => rm(directory, { recursive: true, force: true }));
+  const socketPath = join(directory, "axl.sock");
+  const cwd = await realpath(directory);
+  const daemon = new AxlDaemon({
+    socketPath,
+    dataDirectory: join(directory, "data"),
+    runtime: ({ selection }) => ({
+      model: replyPort(),
+      tools: new ToolRegistry(),
+      configProfile: { profile: selection.profile ?? "standard" },
+    }),
+  });
+  await daemon.start();
+  context.after(() => daemon.stop());
+  const client = await connectUnixClient(socketPath);
+  context.after(() => client.close());
+  const standard = await client.request("session.create", { cwd });
+  const chat = await client.request("session.create", { cwd, profile: "chat" });
+  const listed = await client.request("session.list", {
+    scope: "all_local",
+    order: "recent",
+    pageSize: 50,
+  });
+  assert.equal(
+    listed.sessions.find((session) => session.sessionId === standard.sessionId)?.profile,
+    "standard",
+  );
+  assert.equal(
+    listed.sessions.find((session) => session.sessionId === chat.sessionId)?.profile,
+    "chat",
+  );
+});
+
 test("expires incomplete snapshots and requires a replacement boundary", async (context) => {
   const directory = await mkdtemp(join(tmpdir(), "axl-daemon-"));
   context.after(() => rm(directory, { recursive: true, force: true }));
@@ -741,6 +946,58 @@ test("expires an initialized attachment that stops sending heartbeats", async (c
   assert.equal(initialized.kind, "success");
   await waitFor(() => snapshots.includes(2), "stale attachment presence");
   await waitFor(() => snapshots.at(-1) === 1, "stale attachment expiry");
+});
+
+test("derives model-callable tools from the daemon command registry", () => {
+  const tools = new ToolRegistry();
+  const installed = installDaemonCommandCapabilities({
+    tools,
+    compact: () => Promise.resolve({ state: "queued" }),
+    reload: () => Promise.resolve({ state: "queued" }),
+  });
+  const commands = commandCatalog(new Set(["session.compact", "session.reload"]));
+
+  assert.deepEqual(
+    installed.source.records.map((record) => record.provenance),
+    commands.commands.map((command) => command.id),
+  );
+  assert.deepEqual(tools.declarations(), []);
+});
+
+test("model MCP configuration uses the daemon-owned store and queues reload", async () => {
+  const tools = new ToolRegistry();
+  const configured: Array<[string, unknown]> = [];
+  let reloads = 0;
+  const installed = installDaemonCommandCapabilities({
+    tools,
+    compact: () => Promise.resolve({ state: "queued" }),
+    reload: () => {
+      reloads += 1;
+      return Promise.resolve({ state: "queued" });
+    },
+    mcp: {
+      list: () => Promise.resolve({ path: "/tmp/mcp.json", servers: [] }),
+      upsert: (name, definition) => {
+        configured.push([name, definition]);
+        return Promise.resolve({
+          path: "/tmp/mcp.json",
+          servers: [{ name, definition, status: "pending" as const, tools: [] }],
+          changed: true,
+        });
+      },
+      remove: () => Promise.resolve({ path: "/tmp/mcp.json", servers: [], changed: true }),
+    },
+  });
+  assert.ok(installed.source.records.some((record) => record.identity === "tool:configure-mcp"));
+  tools.activateCapability("tool:configure-mcp");
+  await tools
+    .get("configure_mcp")
+    ?.execute(
+      { action: "upsert", name: "context7", definition: { url: "https://mcp.context7.com/mcp" } },
+      new AbortController().signal,
+    );
+  assert.deepEqual(configured, [["context7", { url: "https://mcp.context7.com/mcp" }]]);
+  assert.equal(reloads, 1);
 });
 
 test("publishes a capability-filtered command catalog", async (context) => {
@@ -1151,7 +1408,7 @@ test("creates a session, streams the live tail, and answers sends", async (conte
   const pushed: WireEvent[] = [];
   client.onEvent((event) => pushed.push(event));
   const { events: snapshot } = await subscribeAll(client, created.sessionId);
-  assert.deepEqual(types(snapshot), ["session.created"]);
+  assert.deepEqual(types(snapshot), ["session.created", "context.resources"]);
 
   const sent = (await client.request("session.send", {
     sessionId: created.sessionId,
@@ -1375,7 +1632,12 @@ test("events appended between resume and subscribe enter the frozen snapshot", a
   });
 
   const { events } = await subscribeAll(attaching, created.sessionId);
-  assert.deepEqual(types(events), ["session.created", "user.message", "assistant.message"]);
+  assert.deepEqual(types(events), [
+    "session.created",
+    "context.resources",
+    "user.message",
+    "assistant.message",
+  ]);
 });
 
 test("streams transient deltas and resumes the latest accumulated activity", async (context) => {
@@ -1479,7 +1741,7 @@ test("uploads image blobs in chunks without persisting bytes in JSONL", async (c
     content: [{ type: "blob", blob }],
   });
   await waitFor(
-    () => observerSubscription.projector.state.records.length === 3,
+    () => observerSubscription.projector.state.records.length === 4,
     "attachment projection in second client",
   );
   assert.deepEqual(
@@ -1668,7 +1930,12 @@ test("a session survives daemon termination and resumes with full history", asyn
   });
   assert.equal(resumed.sessionId, created.sessionId);
   const { events: paged } = await subscribeAll(reconnected, created.sessionId);
-  assert.deepEqual(types(paged), ["session.created", "user.message", "assistant.message"]);
+  assert.deepEqual(types(paged), [
+    "session.created",
+    "context.resources",
+    "user.message",
+    "assistant.message",
+  ]);
 
   const sent = (await reconnected.request("session.send", {
     sessionId: created.sessionId,
@@ -3055,6 +3322,83 @@ test("steering and follow-ups cross clients through the daemon", async (context)
   assert.deepEqual(prompts, ["start", "adjust", "then summarize"]);
 });
 
+test("manual compaction queues behind an active response and runs for every client", async (context) => {
+  let releaseActive = (): void => undefined;
+  const activeGate = new Promise<void>((resolvePromise) => {
+    releaseActive = resolvePromise;
+  });
+  let markActive = (): void => undefined;
+  const activeStarted = new Promise<void>((resolvePromise) => {
+    markActive = resolvePromise;
+  });
+  let calls = 0;
+  const model: ModelPort = {
+    stream() {
+      const call = ++calls;
+      return (async function* (): AsyncGenerator<ModelStreamEvent> {
+        if (call === 3) {
+          markActive();
+          await activeGate;
+        }
+        yield {
+          type: "text_delta",
+          text: call === 4 ? "## Goal\nContinue after compaction" : `reply ${call}`,
+        };
+        yield { type: "completed", stopReason: "stop", usage };
+      })();
+    },
+  };
+  const { socketPath, cwd } = await startDaemon(context, model, "sandboxed", undefined, undefined, {
+    compaction: { keepRecentTokens: 1 },
+  });
+  const sender = await connectUnixClient(socketPath);
+  const controller = await connectUnixClient(socketPath);
+  context.after(() => {
+    sender.close();
+    controller.close();
+  });
+  const created = await sender.request("session.create", { cwd });
+  const subscription = await subscribeSession(controller, created.sessionId);
+  context.after(() => subscription.close());
+
+  for (const text of ["old prompt", "recent prompt"]) {
+    await sender.request("session.send", {
+      sessionId: created.sessionId,
+      delivery: "prompt",
+      content: [{ type: "text", text }],
+    });
+  }
+  const active = sender.request("session.send", {
+    sessionId: created.sessionId,
+    delivery: "prompt",
+    content: [{ type: "text", text: "active prompt" }],
+  });
+  await activeStarted;
+  const queued = await controller.request("session.compact", {
+    sessionId: created.sessionId,
+    instructions: "Keep exact decisions",
+  });
+  assert.equal(queued.state, "queued");
+  releaseActive();
+  await active;
+  await waitFor(
+    () => subscription.projector.state.lastCompaction !== undefined,
+    "queued compaction completion",
+  );
+
+  const events = subscription.projector.state.records.flatMap((record) =>
+    record.kind === "event" ? [record.event] : [],
+  );
+  const responseIndex = events.findIndex(
+    (event) =>
+      event.type === "assistant.message" &&
+      event.payload.content.some((item) => item.type === "text" && item.text === "reply 3"),
+  );
+  const queuedIndex = events.findIndex((event) => event.type === "compaction.queued");
+  const compactedIndex = events.findIndex((event) => event.type === "context.compacted");
+  assert.ok(queuedIndex >= 0 && responseIndex > queuedIndex && compactedIndex > responseIndex);
+});
+
 test("daemon-owned queued prompts are canonical and execute in priority order", async (context) => {
   const paused = pausedActivityPort();
   const { socketPath, cwd } = await startDaemon(context, paused.port);
@@ -3557,6 +3901,7 @@ test("selected-node subscriptions remain bound to the selected lineage", async (
   assert.ok(descriptor);
   assert.deepEqual(types(descriptor.page.events), [
     "session.created",
+    "context.resources",
     "user.message",
     "assistant.message",
   ]);
@@ -3645,7 +3990,7 @@ test("SDK automatically recovers a canonical sequence gap from the daemon", asyn
   assert.match(recoveries[0]?.message ?? "", /out of order/);
   assert.deepEqual(
     subscription.projector.state.records.map((record) => record.event.type),
-    ["session.created", "user.message", "assistant.message"],
+    ["session.created", "context.resources", "user.message", "assistant.message"],
   );
 });
 
@@ -3744,7 +4089,7 @@ test("SDK replaces an expired reconnect cursor with an authoritative snapshot", 
     delivery: "prompt",
     content: [{ type: "text", text: "authoritative replacement" }],
   });
-  await waitFor(() => subscription.projector.state.records.length === 3, "initial live delivery");
+  await waitFor(() => subscription.projector.state.records.length === 4, "initial live delivery");
   const expected = subscription.projector.state;
 
   expireNextResume = true;
@@ -3810,8 +4155,8 @@ test("TUI-style and SDK attachments observe identical canonical state", async (c
   });
   await waitFor(
     () =>
-      tuiSubscription.projector.state.records.length === 3 &&
-      sdkSubscription.projector.state.records.length === 3,
+      tuiSubscription.projector.state.records.length === 4 &&
+      sdkSubscription.projector.state.records.length === 4,
     "both attachment projections",
   );
 
@@ -3949,9 +4294,21 @@ test("routes runtime interaction requests to an attached client", async (context
         async execute(_input, signal) {
           const response = await interact(
             {
-              kind: "mcp_tool",
-              source: "mcp:test",
-              message: "Allow test tool?",
+              kind: "user_question",
+              source: "ask_user_question",
+              message: "Choose a runtime?",
+              data: {
+                questions: [
+                  {
+                    header: "Runtime",
+                    question: "Choose a runtime?",
+                    options: [
+                      { label: "Node", description: "Use Node.js" },
+                      { label: "Bun", description: "Use Bun" },
+                    ],
+                  },
+                ],
+              },
             },
             signal,
           );
@@ -3987,11 +4344,25 @@ test("routes runtime interaction requests to an attached client", async (context
     if (!interaction) await new Promise((resolvePromise) => setTimeout(resolvePromise, 5));
   }
   assert.ok(interaction);
+  await assert.rejects(
+    client.request(
+      "session.interaction.respond",
+      {
+        sessionId: created.sessionId,
+        interactionId: interaction.payload.interactionId,
+        action: "accept",
+        content: { answers: [{ questionIndex: 0, selectedLabels: ["Deno"] }] },
+      },
+      { idempotencyKey: "00000000-0000-4000-8000-000000000122" },
+    ),
+    (error) => error instanceof AxlClientError && error.code === "invalid_interaction_response",
+  );
   const responseKey = "00000000-0000-4000-8000-000000000104";
   const responseParams = {
     sessionId: created.sessionId,
     interactionId: interaction.payload.interactionId,
     action: "accept" as const,
+    content: { answers: [{ questionIndex: 0, selectedLabels: ["Node"] }] },
   };
   const responseRequest = client.request("session.interaction.respond", responseParams, {
     idempotencyKey: responseKey,
@@ -4450,7 +4821,7 @@ test("configuration changes rebuild and log the selected model and thinking", as
   assert.equal(changed.profile, "standard");
   assert.equal(changed.webFetch, false);
   assert.equal(changed.webSearch, false);
-  assert.equal(changed.boundaryEventIds.length, 4);
+  assert.equal(changed.boundaryEventIds.length, 5);
 
   client.close();
   await daemon.stop();
@@ -4507,14 +4878,33 @@ test("reload rebuilds the runtime as a logged boundary with live subscriptions",
   context.after(() => rm(directory, { recursive: true, force: true }));
   const socketPath = join(directory, "axl.sock");
   const boundaries: string[] = [];
+  let resourceGeneration = 0;
   const daemon = new AxlDaemon({
     socketPath,
     dataDirectory: join(directory, "data"),
-    runtime: ({ boundary }) => {
+    runtime: ({ boundary, contextResources }) => {
       boundaries.push(boundary);
+      const resources = contextResources ?? [
+        {
+          kind: "agents" as const,
+          scope: "project" as const,
+          path: join(directory, "AGENTS.md"),
+          content: `Rules ${++resourceGeneration}`,
+        },
+      ];
       return {
         model: replyPort(),
         tools: new ToolRegistry(),
+        contextResources: resources,
+        prompt: buildStablePrompt({
+          cwd: directory,
+          tools: [],
+          instructions: resources.map((resource, index) => ({
+            name: `agents-${index}`,
+            source: resource.path,
+            content: resource.content,
+          })),
+        }),
         ...(boundary === "config_change"
           ? {}
           : {
@@ -4548,6 +4938,22 @@ test("reload rebuilds the runtime as a logged boundary with live subscriptions",
     (event) => event.type === "config.dialect" && reloaded.boundaryEventIds.includes(event.id),
   );
   assert.equal(dialect?.type === "config.dialect" && dialect.payload.reason, "reload");
+  const resources = pushed.find(
+    (event) => event.type === "context.resources" && reloaded.boundaryEventIds.includes(event.id),
+  );
+  assert.equal(
+    resources?.type === "context.resources" && resources.payload.resources[0]?.content,
+    "Rules 2",
+  );
+  assert.equal(
+    pushed
+      .filter((event) => event.type === "prompt.section")
+      .some(
+        (event) =>
+          reloaded.boundaryEventIds.includes(event.id) && event.payload.content.includes("Rules 2"),
+      ),
+    true,
+  );
   assert.equal(
     pushed
       .filter((event) => reloaded.boundaryEventIds.includes(event.id))
@@ -4558,27 +4964,33 @@ test("reload rebuilds the runtime as a logged boundary with live subscriptions",
   client.close();
   await daemon.stop();
   await removeCommandCompletions(join(directory, "data"), new Set([reloadKey]));
+  const restartedResources: string[] = [];
   const restarted = new AxlDaemon({
     socketPath,
     dataDirectory: join(directory, "data"),
-    runtime: ({ boundary }) => ({
-      model: replyPort(),
-      tools: new ToolRegistry(),
-      ...(boundary === "config_change"
-        ? {}
-        : {
-            configDialect: {
-              dialectId: "generic" as const,
-              rosterFingerprint: "f".repeat(64),
-              reason: boundary,
-            },
-          }),
-    }),
+    runtime: ({ boundary, contextResources }) => {
+      restartedResources.push(contextResources?.[0]?.content ?? "rediscovered");
+      return {
+        model: replyPort(),
+        tools: new ToolRegistry(),
+        contextResources: contextResources ?? [],
+        ...(boundary === "config_change"
+          ? {}
+          : {
+              configDialect: {
+                dialectId: "generic" as const,
+                rosterFingerprint: "f".repeat(64),
+                reason: boundary,
+              },
+            }),
+      };
+    },
   });
   await restarted.start();
   context.after(() => restarted.stop());
   const recoveredClient = await connectUnixClient(socketPath);
   context.after(() => recoveredClient.close());
+  assert.deepEqual(restartedResources, ["Rules 2"]);
   assert.deepEqual(
     await recoveredClient.request(
       "session.reload",
@@ -4600,4 +5012,199 @@ test("reload rebuilds the runtime as a logged boundary with live subscriptions",
     content: [{ type: "text", text: "after reload" }],
   });
   assert.equal(sent.stopReason, "stop");
+});
+
+test("failed runtime activation preserves the previous session without partial boundary events", async (context) => {
+  const directory = await mkdtemp(join(tmpdir(), "axl-daemon-atomic-reload-"));
+  context.after(() => rm(directory, { recursive: true, force: true }));
+  const socketPath = join(directory, "axl.sock");
+  const lifecycle: string[] = [];
+  let runtimeGeneration = 0;
+  const daemon = new AxlDaemon({
+    socketPath,
+    dataDirectory: join(directory, "data"),
+    runtime: () => {
+      runtimeGeneration += 1;
+      const generation = runtimeGeneration;
+      return {
+        model: replyPort(),
+        tools: new ToolRegistry(),
+        extensionHost: {
+          activate: () => {
+            lifecycle.push(`activate:${generation}`);
+            if (generation === 2) {
+              throw new ExtensionHostError("replacement activation failed", {
+                extensionId: "broken",
+                phase: "activate",
+              });
+            }
+          },
+          dispose: () => {
+            lifecycle.push(`dispose:${generation}`);
+          },
+        },
+      };
+    },
+  });
+  await daemon.start();
+  context.after(() => daemon.stop());
+  const client = await connectUnixClient(socketPath);
+  context.after(() => client.close());
+  const created = await client.request("session.create", { cwd: directory });
+  const before = await subscribeAll(client, created.sessionId);
+
+  await assert.rejects(
+    client.request(
+      "session.reload",
+      { sessionId: created.sessionId },
+      { idempotencyKey: "00000000-0000-4000-8000-000000000107" },
+    ),
+    (error) =>
+      error instanceof AxlClientError &&
+      error.code === "extension_failed" &&
+      /replacement activation failed/.test(error.message),
+  );
+
+  const after = await subscribeAll(client, created.sessionId);
+  assert.deepEqual(
+    after.events.map((event) => event.id),
+    before.events.map((event) => event.id),
+  );
+  assert.deepEqual(lifecycle, ["activate:1", "activate:2", "dispose:2"]);
+  const sent = await client.request("session.send", {
+    sessionId: created.sessionId,
+    delivery: "prompt",
+    content: [{ type: "text", text: "still active" }],
+  });
+  assert.equal(sent.stopReason, "stop");
+  assert.equal(lifecycle.includes("dispose:1"), false);
+});
+
+test("session disposal retries cleanup left by an atomic replacement", async (context) => {
+  const directory = await mkdtemp(join(tmpdir(), "axl-daemon-reload-cleanup-"));
+  context.after(() => rm(directory, { recursive: true, force: true }));
+  const socketPath = join(directory, "axl.sock");
+  const disposals = new Map<number, number>();
+  let generation = 0;
+  const daemon = new AxlDaemon({
+    socketPath,
+    dataDirectory: join(directory, "data"),
+    runtime: () => {
+      generation += 1;
+      const current = generation;
+      return {
+        model: replyPort(),
+        tools: new ToolRegistry(),
+        extensionHost: {
+          activate: () => undefined,
+          dispose: () => {
+            const attempts = (disposals.get(current) ?? 0) + 1;
+            disposals.set(current, attempts);
+            if (current === 1 && attempts === 1) throw new Error("cleanup failed once");
+          },
+        },
+      };
+    },
+  });
+  await daemon.start();
+  context.after(() => daemon.stop());
+  const client = await connectUnixClient(socketPath);
+  context.after(() => client.close());
+  const created = await client.request("session.create", { cwd: directory });
+
+  await assert.rejects(
+    client.request(
+      "session.reload",
+      { sessionId: created.sessionId },
+      { idempotencyKey: "00000000-0000-4000-8000-000000000108" },
+    ),
+    AxlClientError,
+  );
+  assert.equal(
+    (
+      await client.request("session.send", {
+        sessionId: created.sessionId,
+        delivery: "prompt",
+        content: [{ type: "text", text: "new runtime" }],
+      })
+    ).stopReason,
+    "stop",
+  );
+  await client.request(
+    "session.dispose",
+    { sessionId: created.sessionId },
+    { idempotencyKey: "00000000-0000-4000-8000-000000000109" },
+  );
+  assert.deepEqual(
+    [...disposals],
+    [
+      [1, 2],
+      [2, 1],
+    ],
+  );
+});
+
+test("extensions replace or refuse built-in commands through command_blocked", async (context) => {
+  const seen: string[] = [];
+  const fixture = await startDaemon(context, replyPort(), "sandboxed", undefined, undefined, {
+    extensionHost: {
+      activate: () => undefined,
+      dispose: () => undefined,
+      beforeCommand: (command) => {
+        seen.push(`${command.source}:${command.name}`);
+        if (command.name === "rename") {
+          if (command.args.title === "secret") return { block: true, reason: "no secrets" };
+          if (command.args.title === "invalid") return { args: { title: "" } };
+          return { args: { title: `${String(command.args.title)} (reviewed)` } };
+        }
+        if (command.name === "thinking") return { args: { thinkingLevel: "bogus" } };
+        return undefined;
+      },
+    },
+  });
+  const client = await connectUnixClient(fixture.socketPath);
+  context.after(() => client.close());
+  const created = await client.request("session.create", { cwd: fixture.cwd });
+
+  await assert.rejects(
+    client.request(
+      "session.rename",
+      { sessionId: created.sessionId, title: "secret" },
+      { idempotencyKey: "00000000-0000-4000-8000-000000000301" },
+    ),
+    (error) =>
+      error instanceof AxlClientError &&
+      error.code === "command_blocked" &&
+      /no secrets/.test(error.message),
+  );
+  const renamed = await client.request(
+    "session.rename",
+    { sessionId: created.sessionId, title: "Plan" },
+    { idempotencyKey: "00000000-0000-4000-8000-000000000302" },
+  );
+  assert.equal(renamed.title, "Plan (reviewed)");
+  await assert.rejects(
+    client.request(
+      "session.rename",
+      { sessionId: created.sessionId, title: "invalid" },
+      { idempotencyKey: "00000000-0000-4000-8000-000000000304" },
+    ),
+    (error) =>
+      error instanceof AxlClientError &&
+      error.code === "command_blocked" &&
+      /invalid/.test(error.message),
+  );
+
+  await assert.rejects(
+    client.request(
+      "session.configure",
+      { sessionId: created.sessionId, thinkingLevel: "high" },
+      { idempotencyKey: "00000000-0000-4000-8000-000000000303" },
+    ),
+    (error) =>
+      error instanceof AxlClientError &&
+      error.code === "command_blocked" &&
+      /thinkingLevel/.test(error.message),
+  );
+  assert.deepEqual(seen, ["client:rename", "client:rename", "client:rename", "client:thinking"]);
 });

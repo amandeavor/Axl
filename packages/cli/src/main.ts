@@ -46,6 +46,7 @@ import { connectUnixClient, createUnixDaemonHost } from "@axl/sdk/unix";
 
 import { launchBrowser } from "./browser-launch.ts";
 import { inspectLegacyDaemon, type LegacyDaemonStatus, stopLegacyDaemon } from "./legacy-daemon.ts";
+import { DEFAULT_LOUNGE_SETTINGS, LoungeStorage } from "./lounge-storage.ts";
 import { createTerminalProviderLoginAdapter } from "./provider-auth-ui.ts";
 import { providerErrorMessage, runProviderCommand, usageLine } from "./provider-cli.ts";
 import { loadTuiSettings, saveTuiSettings, type TuiSettings } from "./settings.ts";
@@ -965,6 +966,7 @@ async function main(): Promise<void> {
     }),
     modelId: cli.model ?? settings.modelId ?? "gpt-5",
     thinkingLevel: cli.thinking ?? settings.thinkingLevel ?? "medium",
+    ...(settings.compaction === undefined ? {} : { compaction: settings.compaction }),
     webFetch: cli.webFetch ?? settings.webFetch ?? true,
     webSearch: cli.webSearch ?? settings.webSearch ?? true,
   };
@@ -1068,6 +1070,9 @@ async function main(): Promise<void> {
     ...(cli.image === undefined ? {} : { image: cli.image }),
   };
   const webGateways = new Set<{ readonly close: () => Promise<void> }>();
+  /** The browser shares the terminal's Lounge setting and local saves. */
+  const webLounge = (): { readonly lounge?: LoungeStorage } =>
+    (settings.loungeEnabled ?? true) ? { lounge: new LoungeStorage(join(axlHome, "lounge")) } : {};
   const openWebForTarget =
     (target: LocalDaemonTarget) =>
     async (
@@ -1083,6 +1088,7 @@ async function main(): Promise<void> {
         assetDirectory: resolve(dirname(fileURLToPath(import.meta.url)), WEB_ASSET_RELATIVE_PATH),
         packageVersion: AXL_VERSION,
         providerHost,
+        ...webLounge(),
       });
       try {
         await launchBrowser(`${gateway.launchUrl}&session=${encodeURIComponent(sessionId)}`);
@@ -1114,6 +1120,7 @@ async function main(): Promise<void> {
       cwd: cli.cwd,
       assetDirectory: resolve(dirname(fileURLToPath(import.meta.url)), WEB_ASSET_RELATIVE_PATH),
       packageVersion: AXL_VERSION,
+      ...webLounge(),
       ...(process.stdin.isTTY === true && process.stdout.isTTY === true
         ? {
             providerHost: {
@@ -1125,14 +1132,28 @@ async function main(): Promise<void> {
           }
         : {}),
     });
-    process.stdout.write(`Axl web: ${gateway.origin}\n`);
-    const launchUrl =
-      cli.sessionId === undefined
-        ? gateway.launchUrl
-        : `${gateway.launchUrl}&session=${encodeURIComponent(cli.sessionId)}`;
+    process.stdout.write(`Axl web is running at ${gateway.origin}\n`);
+    const withSession = (url: string): string =>
+      cli.sessionId === undefined ? url : `${url}&session=${encodeURIComponent(cli.sessionId)}`;
+    const launchUrl = withSession(gateway.launchUrl);
     if (cli.printUrl) {
       // Explicitly requested token-bearing URL: one use, expires in 60 seconds.
       process.stdout.write(`Open within 60 seconds (one use): ${launchUrl}\n`);
+    }
+    if (process.stdin.isTTY === true && process.stdout.isTTY === true) {
+      // The opened link is single use, so another browser needs its own link.
+      process.stdout.write("Press Enter for a one-use link to sign in from another browser.\n");
+      process.stdin.setEncoding("utf8");
+      process.stdin.on("data", (text: string) => {
+        if (!text.includes("\n")) return;
+        process.stdout.write(
+          `Open within 60 seconds (one use): ${withSession(gateway.issueLaunchUrl())}\n`,
+        );
+      });
+    } else if (!cli.printUrl) {
+      process.stdout.write(
+        "Run `axl web --no-open --print-url` for a link to open in another browser.\n",
+      );
     }
     if (!cli.noOpen) {
       try {
@@ -1212,6 +1233,16 @@ async function main(): Promise<void> {
     };
   };
 
+  const loungeEnabled = settings.loungeEnabled ?? true;
+  const loungeStorage = new LoungeStorage(join(axlHome, "lounge"));
+  let loungeSettingsError: string | undefined;
+  const loungeSettings = loungeEnabled
+    ? await loungeStorage.loadSettings().catch((error: unknown) => {
+        loungeSettingsError = error instanceof Error ? error.message : String(error);
+        return DEFAULT_LOUNGE_SETTINGS;
+      })
+    : DEFAULT_LOUNGE_SETTINGS;
+
   let settingsWrite: Promise<void> = Promise.resolve();
   const persistSettings = (update: Partial<Omit<TuiSettings, "version">>): Promise<void> => {
     settings = { ...settings, ...update, version: 1 };
@@ -1222,18 +1253,20 @@ async function main(): Promise<void> {
     return settingsWrite;
   };
 
-  const [
-    { AxlApp },
-    { mcpTerminalExtension },
-    { promptTemplatesExtension },
-    { skillTerminalExtension },
-  ] = await Promise.all([
-    tuiModule ?? import("@axl/tui"),
-    import("@axl/extension-mcp"),
-    import("@axl/extension-prompts"),
-    import("@axl/extension-skills"),
-  ]);
+  const { AxlApp, loadTerminalExtensions } = await (tuiModule ?? import("@axl/tui"));
+  const { createLoungeExtension } = await import("@axl/extension-lounge/terminal");
   timing.mark("TUI modules");
+  let previousLoungeSeed = Date.now() - 1;
+  const nextLoungeSeed = (): number => {
+    previousLoungeSeed = Math.max(Date.now(), previousLoungeSeed + 1);
+    return previousLoungeSeed;
+  };
+  const loungeExtension = createLoungeExtension({
+    utcDate: () => new Date().toISOString().slice(0, 10),
+    practiceSeed: nextLoungeSeed,
+    game2048Seed: nextLoungeSeed,
+    minesweeperSeed: nextLoungeSeed,
+  });
   const app = await AxlApp.start({
     client,
     daemonHost: createUnixDaemonHost(socketPath),
@@ -1262,12 +1295,43 @@ async function main(): Promise<void> {
     diffLayout: settings.diffLayout ?? "unified",
     workspaceReview: settings.workspaceReview ?? false,
     imageDisplay: settings.imageDisplay ?? "auto",
+    mascot: settings.mascot ?? true,
+    ...(settings.mascotColour === undefined ? {} : { mascotColour: settings.mascotColour }),
+    loungeEnabled,
+    loungeExtensionIds: [loungeExtension.manifest.id],
+    ...(loungeSettings.lastActivityId === undefined
+      ? {}
+      : { loungeLastActivityId: loungeSettings.lastActivityId }),
+    loungeReducedMotion: loungeSettings.reducedMotion,
+    loungeTextOnly: loungeSettings.textOnly,
+    activityStorage: loungeStorage,
+    loadLoungePreferences: () => loungeStorage.loadSettings(),
+    onLoungePreferenceChange: (update) =>
+      loungeStorage.updateSettings(update).then(() => undefined),
     globalThemeDirectory: join(axlHome, "themes"),
-    extensions: [
-      mcpTerminalExtension,
-      promptTemplatesExtension({ cwd: cli.cwd, globalDirectory: join(axlHome, "prompts") }),
-      skillTerminalExtension,
-    ],
+    loadExtensions: async (terminalClient, sessionId) => {
+      const inventory = await terminalClient.listExtensions({ sessionId });
+      const builtins = await Promise.all(
+        inventory.extensions
+          .filter((entry) => entry.enabled && entry.source === "builtin")
+          .map(async (entry) => {
+            if (entry.id === "axl.prompt-templates") {
+              const { promptTemplatesExtension } = await import("@axl/extension-prompts");
+              return promptTemplatesExtension({
+                cwd: cli.cwd,
+                globalDirectory: join(axlHome, "prompts"),
+              });
+            }
+            if (entry.id === "axl.skills") {
+              const { skillTerminalExtension } = await import("@axl/extension-skills");
+              return skillTerminalExtension;
+            }
+            throw new Error(`Unknown built-in terminal extension ${entry.id}`);
+          }),
+      );
+      return loadTerminalExtensions(inventory, builtins);
+    },
+    extensions: [loungeExtension],
     clearStartupLine: startupIndicator,
     reconnectClient: () => connectTarget(currentTarget),
     openWeb: openWebForTarget(currentTarget),
@@ -1291,6 +1355,10 @@ async function main(): Promise<void> {
   timing.mark("first paint");
   const timingSummary = timing.summary();
   if (timingSummary !== undefined) app.showLocalNotice(timingSummary);
+  if (loungeSettingsError !== undefined)
+    app.showLocalNotice(
+      `Lounge settings could not be read, so defaults are in use: ${loungeSettingsError}`,
+    );
 }
 
 main().catch((error: unknown) => {

@@ -4,9 +4,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { createHash } from "node:crypto";
-
-import { type AxlClient, uploadBlob as uploadSessionBlob } from "@axl/sdk";
 import { type BlobReference, parseBlobReadResult, type SessionId } from "@axl/protocol";
+import { type AxlClient, uploadBlob as uploadSessionBlob } from "@axl/sdk";
 
 import type { Component } from "./render.ts";
 import { sanitizeTerminalText, truncateToWidth, wrapLine } from "./render.ts";
@@ -17,6 +16,7 @@ export type ImageDisplay = "auto" | "inline" | "metadata";
 
 export interface TerminalMediaCapabilities {
   readonly images: ImageProtocol;
+  readonly activityRaster?: "sixel" | null;
 }
 
 export interface ImageDimensions {
@@ -28,13 +28,48 @@ const MAX_RENDER_BYTES = 2 * 1024 * 1024;
 const READ_CHUNK_BYTES = 384 * 1024;
 const MAX_CACHE_BYTES = 32 * 1024 * 1024;
 
+/**
+ * Whether the terminal draws 24-bit colour. COLORTERM is the terminals' own
+ * signal; the rest are terminals known to support it that do not always set
+ * it. Anything else, Apple Terminal among them, is treated as 256 colours.
+ */
+export function detectTruecolour(env: NodeJS.ProcessEnv = process.env): boolean {
+  const colorterm = env.COLORTERM?.toLowerCase();
+  if (colorterm === "truecolor" || colorterm === "24bit") return true;
+  const term = env.TERM?.toLowerCase() ?? "";
+  if (term.includes("direct") || term.includes("truecolor")) return true;
+  const program = env.TERM_PROGRAM?.toLowerCase();
+  return Boolean(
+    env.WT_SESSION ||
+      env.KITTY_WINDOW_ID ||
+      env.WEZTERM_PANE ||
+      env.GHOSTTY_RESOURCES_DIR ||
+      program === "iterm.app" ||
+      program === "wezterm" ||
+      program === "ghostty" ||
+      program === "kitty" ||
+      program === "vscode",
+  );
+}
+
 export function detectTerminalMedia(
   env: NodeJS.ProcessEnv = process.env,
 ): TerminalMediaCapabilities {
-  const override = env.AXL_IMAGE_PROTOCOL?.toLowerCase();
-  if (override === "none" || override === "0") return { images: null };
-  if (override === "kitty" || override === "iterm2") return { images: override };
-  if (env.TMUX || env.TERM?.toLowerCase().startsWith("screen")) return { images: null };
+  const imageOverride = env.AXL_IMAGE_PROTOCOL?.toLowerCase();
+  const rasterOverride = env.AXL_ACTIVITY_RASTER_PROTOCOL?.toLowerCase();
+  const multiplexed = Boolean(env.TMUX || env.TERM?.toLowerCase().startsWith("screen"));
+  const activityRaster =
+    rasterOverride === "sixel"
+      ? "sixel"
+      : rasterOverride === "none" || rasterOverride === "0" || multiplexed
+        ? null
+        : env.WT_SESSION
+          ? "sixel"
+          : null;
+  if (imageOverride === "none" || imageOverride === "0") return { images: null, activityRaster };
+  if (imageOverride === "kitty" || imageOverride === "iterm2")
+    return { images: imageOverride, activityRaster };
+  if (multiplexed) return { images: null, activityRaster };
   const program = env.TERM_PROGRAM?.toLowerCase();
   if (
     env.KITTY_WINDOW_ID ||
@@ -44,10 +79,10 @@ export function detectTerminalMedia(
     program === "wezterm" ||
     program === "ghostty"
   ) {
-    return { images: "kitty" };
+    return { images: "kitty", activityRaster };
   }
-  if (env.ITERM_SESSION_ID || program === "iterm.app") return { images: "iterm2" };
-  return { images: null };
+  if (env.ITERM_SESSION_ID || program === "iterm.app") return { images: "iterm2", activityRaster };
+  return { images: null, activityRaster };
 }
 
 function ascii(bytes: Uint8Array, start: number, end: number): string {

@@ -9,6 +9,7 @@ import test from "node:test";
 import {
   buildReleasePackage,
   publicManifest,
+  RELEASE_EXTERNALS,
   validateReleaseVersion,
 } from "./build-release-package.ts";
 
@@ -27,8 +28,22 @@ test("creates a public CLI manifest without workspace dependencies", () => {
   assert.equal(manifest.name, "@observal/axl");
   assert.equal(manifest.version, "0.1.0-beta.2");
   assert.deepEqual(manifest.bin, { axl: "dist/axl.js" });
+  assert.deepEqual(manifest.exports, {
+    "./extension-api": { types: "./dist/extension-api.d.ts" },
+  });
   assert.deepEqual(manifest.dependencies, { yaml: "2.8.3" });
   assert.equal("private" in manifest, false);
+});
+
+test("every bundler external is a declared release runtime dependency", () => {
+  const dependencies = Object.keys(
+    JSON.parse(readFileSync("distribution/npm/package.json", "utf8")).dependencies,
+  );
+  for (const external of RELEASE_EXTERNALS) {
+    assert.ok(dependencies.includes(external.replace(/\/\*$/u, "")), external);
+  }
+  // The sandbox launcher must install with its platform binary instead of being bundled.
+  assert.ok(RELEASE_EXTERNALS.includes("@deepseek-ai/node-addon-landlock-run"));
 });
 
 test("accepts only supported release versions", () => {
@@ -49,6 +64,7 @@ test("the release package contains matching verified web assets", () => {
   const result = buildReleasePackage("0.0.0");
   const listing = spawnSync("tar", ["-tzf", result.packagePath], { encoding: "utf8" });
   assert.equal(listing.status, 0, listing.stderr);
+  assert.match(listing.stdout, /^package\/dist\/extension-api\.d\.ts$/m);
   assert.match(listing.stdout, /^package\/dist\/web\/asset-metadata\.json$/m);
   assert.match(listing.stdout, /^package\/dist\/web\/index\.html$/m);
   assert.match(listing.stdout, /^package\/dist\/web\/assets\/index-[\w-]+\.js$/m);
@@ -64,5 +80,9 @@ test("the release package contains matching verified web assets", () => {
   assert.match(
     readFileSync(".release/npm/dist/axl.js", "utf8"),
     /createRequire\(import\.meta\.url\)/,
+  );
+  assert.match(
+    readFileSync(".release/npm/dist/extension-api.d.ts", "utf8"),
+    /export interface DaemonExtensionApi/,
   );
 });

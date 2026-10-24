@@ -5,7 +5,7 @@ import { useEffect, useMemo, useRef, useState, type JSX } from "react";
 import type { EffectiveCommand } from "@axl/sdk";
 import { trapDialogFocus } from "./dialog-focus.ts";
 
-import { filterCommands } from "./commands.ts";
+import { filterCommands, suggestCommand } from "./commands.ts";
 
 export function CommandPalette({
   commands,
@@ -35,6 +35,7 @@ export function CommandPalette({
     return () => prior?.focus();
   }, [open]);
 
+  const suggestion = visible.length === 0 ? suggestCommand(commands, query) : undefined;
   if (!open) return null;
   const handleDialogKeyDown = (event: React.KeyboardEvent): void => {
     if (event.key === "Escape") {
@@ -55,7 +56,15 @@ export function CommandPalette({
         <input
           ref={input}
           type="search"
+          role="combobox"
           aria-label="Search commands"
+          aria-controls="command-palette-list"
+          aria-expanded={true}
+          aria-haspopup="listbox"
+          aria-autocomplete="list"
+          {...(visible.length > 0
+            ? { "aria-activedescendant": `command-option-${visible[active]?.id}` }
+            : {})}
           placeholder="Search commands"
           value={query}
           onChange={(event) => { setQuery(event.target.value); setActive(0); }}
@@ -66,11 +75,12 @@ export function CommandPalette({
           }}
         />
         {error && <p className="command-error" role="alert">{error}</p>}
-        <div className="command-list" role="listbox" aria-label="Available commands">
-          {visible.length === 0 && <p>No matching commands</p>}
+        <div id="command-palette-list" className="command-list" role="listbox" aria-label="Available commands">
+          {visible.length === 0 && <p>No matching commands{suggestion && <> · did you mean <strong>/{suggestion}</strong>?</>}</p>}
           {visible.map((command, index) => (
             <button
               key={command.id}
+              id={`command-option-${command.id}`}
               type="button"
               role="option"
               aria-selected={index === active}

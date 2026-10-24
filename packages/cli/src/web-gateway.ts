@@ -8,9 +8,11 @@ import { createConnection, type Socket } from "node:net";
 import { extname, join, resolve, sep } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 
+import { ActivityStorageError, type JsonValue } from "@axl/extension-api";
 import {
   MAX_WIRE_MESSAGE_BYTES,
   type ProviderLoginMethod,
+  parseExtensionId,
   parseProviderAuthenticationStatus,
   parseProviderIdParam,
   parseProviderLoginMethod,
@@ -22,6 +24,8 @@ import {
 import { AxlClientError, type TrustedProviderHost } from "@axl/sdk";
 import { connectUnixClient } from "@axl/sdk/unix";
 import { type WebSocket, WebSocketServer } from "ws";
+
+import { DEFAULT_LOUNGE_SETTINGS, type LoungeStorage } from "./lounge-storage.ts";
 
 const SECURITY_HEADERS = {
   "cache-control": "no-store",
@@ -49,6 +53,8 @@ export interface WebGatewayOptions {
   readonly cwd: string;
   readonly packageVersion: string;
   readonly providerHost?: TrustedProviderHost;
+  /** Present only when Lounge is enabled. The gateway only brokers client-local game saves. */
+  readonly lounge?: LoungeStorage;
   readonly launchToken?: Buffer;
   readonly pathToken?: Buffer;
   /** Test seams may shorten, but never widen, the fixed 60-second attachment idle limit. */
@@ -64,6 +70,11 @@ export interface WebPreferences {
   readonly sidebarCollapsed: boolean;
   readonly changesView: "files" | "all";
   readonly panes: readonly WebPaneId[];
+  readonly theme: "system" | "light" | "dark";
+  readonly loungeOpen: boolean;
+  /** Whether the mascot is shown, and its colour. */
+  readonly mascot: boolean;
+  readonly mascotColour: string;
 }
 
 const MAX_WEB_ARTIFACT_BYTES = 64 * 1024 * 1024;
@@ -75,6 +86,10 @@ const DEFAULT_WEB_PREFERENCES: WebPreferences = {
   sidebarCollapsed: false,
   changesView: "files",
   panes: ["browser", "files"],
+  theme: "system",
+  loungeOpen: true,
+  mascot: true,
+  mascotColour: "Pink",
 };
 
 function isWorkspaceDiffRequest(text: string): boolean {
@@ -104,8 +119,26 @@ function parsePreferences(value: unknown): WebPreferences {
   if (
     Object.keys(record).some(
       (key) =>
-        !["sidebarWidth", "dockWidth", "sidebarCollapsed", "changesView", "panes"].includes(key),
+        ![
+          "sidebarWidth",
+          "dockWidth",
+          "sidebarCollapsed",
+          "changesView",
+          "panes",
+          "theme",
+          "loungeOpen",
+          "mascot",
+          "mascotColour",
+        ].includes(key),
     ) ||
+    (record.loungeOpen !== undefined && typeof record.loungeOpen !== "boolean") ||
+    (record.mascot !== undefined && typeof record.mascot !== "boolean") ||
+    (record.mascotColour !== undefined &&
+      (typeof record.mascotColour !== "string" || !/^[A-Za-z_]+$/.test(record.mascotColour))) ||
+    (record.theme !== undefined &&
+      record.theme !== "system" &&
+      record.theme !== "light" &&
+      record.theme !== "dark") ||
     !Number.isInteger(record.sidebarWidth) ||
     Number(record.sidebarWidth) < 200 ||
     Number(record.sidebarWidth) > 420 ||
@@ -122,12 +155,66 @@ function parsePreferences(value: unknown): WebPreferences {
     sidebarCollapsed: record.sidebarCollapsed,
     changesView: record.changesView,
     panes: parsePaneIds(record.panes),
+    theme: (record.theme as "system" | "light" | "dark" | undefined) ?? "system",
+    loungeOpen: (record.loungeOpen as boolean | undefined) ?? true,
+    mascot: (record.mascot as boolean | undefined) ?? true,
+    mascotColour: (record.mascotColour as string | undefined) ?? "Pink",
   };
+}
+
+const MAX_LOUNGE_REQUEST_BYTES = 512 * 1024;
+
+function loungeScope(value: unknown): { extensionId: string; activityId: string } {
+  const scope = value as Record<string, unknown> | null;
+  if (
+    typeof scope !== "object" ||
+    scope === null ||
+    Object.keys(scope).sort().join() !== "activityId,extensionId" ||
+    typeof scope.extensionId !== "string" ||
+    typeof scope.activityId !== "string"
+  )
+    throw new Error("Invalid Lounge storage scope");
+  return { extensionId: scope.extensionId, activityId: scope.activityId };
+}
+
+/** Maps one browser Lounge request onto the CLI-owned, validated storage. */
+async function handleLoungeRequest(
+  storage: LoungeStorage,
+  relative: "lounge/storage" | "lounge/settings",
+  body: Buffer,
+  signal: AbortSignal,
+): Promise<unknown> {
+  const request = JSON.parse(body.toString("utf8")) as Record<string, unknown> | null;
+  if (typeof request !== "object" || request === null || Array.isArray(request))
+    throw new Error("Invalid Lounge request");
+  if (relative === "lounge/settings") {
+    if (Object.keys(request).join() !== "update") throw new Error("Invalid Lounge request");
+    return storage.updateSettings(request.update as Record<string, never>, signal);
+  }
+  const scope = loungeScope(request.scope);
+  if (request.op === "read") return { value: (await storage.read(scope, signal)) ?? null };
+  if (request.op === "write") {
+    if (!Number.isSafeInteger(request.schemaVersion)) throw new Error("Invalid Lounge request");
+    return storage.write(
+      scope,
+      request.expectedRevision as number | null,
+      request.schemaVersion as number,
+      request.value as JsonValue,
+      signal,
+    );
+  }
+  if (request.op === "reset") {
+    await storage.reset(scope, request.expectedRevision as number, signal);
+    return {};
+  }
+  throw new Error("Invalid Lounge request");
 }
 
 export interface WebGateway {
   readonly origin: string;
   readonly launchUrl: string;
+  /** Replaces the pending launch token with a new one-use link, valid for 60 seconds. */
+  issueLaunchUrl(): string;
   close(): Promise<void>;
 }
 
@@ -435,7 +522,7 @@ export async function verifyWebAssets(
 
 export async function startWebGateway(options: WebGatewayOptions): Promise<WebGateway> {
   const metadata = await verifyWebAssets(options.assetDirectory, options.packageVersion);
-  const launchToken = options.launchToken ?? randomBytes(32);
+  let launchToken = options.launchToken ?? randomBytes(32);
   const pathToken = options.pathToken ?? randomBytes(16);
   const browserCredential = randomBytes(32);
   const webSocketIdleTimeoutMs = Math.min(options.webSocketIdleTimeoutMs ?? 60_000, 60_000);
@@ -444,7 +531,7 @@ export async function startWebGateway(options: WebGatewayOptions): Promise<WebGa
   const prefix = `/a/${pathToken.toString("base64url")}/`;
   const cookieName = "axl_web";
   let launchAvailable = true;
-  const launchExpiresAt = Date.now() + 60_000;
+  let launchExpiresAt = Date.now() + 60_000;
   const credentialExpiresAt = Date.now() + 12 * 60 * 60 * 1_000;
   const preferencesPath = join(options.stateDirectory, "web-preferences.json");
   let preferences = await readFile(preferencesPath, "utf8").then(
@@ -539,6 +626,17 @@ export async function startWebGateway(options: WebGatewayOptions): Promise<WebGa
             cwd: options.cwd,
             webSocketPath: `${prefix}ws`,
             preferences,
+            ...(options.lounge === undefined
+              ? {}
+              : {
+                  lounge: await options.lounge.loadSettings().then(
+                    (settings) => ({ settings }),
+                    (error: unknown) => ({
+                      settings: DEFAULT_LOUNGE_SETTINGS,
+                      error: error instanceof Error ? error.message : String(error),
+                    }),
+                  ),
+                }),
             hostCapabilities: [
               "project.folder.validate",
               ...(options.providerHost === undefined ? [] : ["provider.auth.login"]),
@@ -671,14 +769,84 @@ export async function startWebGateway(options: WebGatewayOptions): Promise<WebGa
         }
         const next = parsePreferences(JSON.parse(Buffer.concat(chunks).toString("utf8")));
         preferences = next;
-        preferenceWrites = preferenceWrites.then(async () => {
-          await mkdir(options.stateDirectory, { recursive: true, mode: 0o700 });
-          const temporary = `${preferencesPath}.${process.pid}.tmp`;
-          await writeFile(temporary, `${JSON.stringify(next)}\n`, { mode: 0o600 });
-          await rename(temporary, preferencesPath);
-        });
-        await preferenceWrites;
+        // Recover from a prior failed write so persistence is not disabled for the
+        // gateway lifetime, and use a unique temp path so concurrent writers do
+        // not clobber each other's temp file. Still surface this write's outcome.
+        const write = preferenceWrites
+          .catch(() => undefined)
+          .then(async () => {
+            await mkdir(options.stateDirectory, { recursive: true, mode: 0o700 });
+            const temporary = `${preferencesPath}.${randomUUID()}.tmp`;
+            try {
+              await writeFile(temporary, `${JSON.stringify(next)}\n`, { mode: 0o600 });
+              await rename(temporary, preferencesPath);
+            } catch (cause) {
+              await rm(temporary, { force: true });
+              throw cause;
+            }
+          });
+        preferenceWrites = write;
+        try {
+          await write;
+        } catch {
+          return send(response, 500, "Could not persist preferences");
+        }
         return send(response, 200, "{}", "application/json; charset=utf-8");
+      }
+      if (
+        request.method === "POST" &&
+        (relative === "lounge/storage" || relative === "lounge/settings")
+      ) {
+        if (!validOrigin(request) || !authorized(request))
+          return send(response, 401, "Authentication required");
+        if (options.lounge === undefined) return send(response, 404, "Not found");
+        const abort = new AbortController();
+        response.once("close", () => abort.abort());
+        try {
+          const result = await handleLoungeRequest(
+            options.lounge,
+            relative,
+            await requestBody(request, MAX_LOUNGE_REQUEST_BYTES),
+            abort.signal,
+          );
+          return send(response, 200, JSON.stringify(result), "application/json; charset=utf-8");
+        } catch (error) {
+          if (!(error instanceof ActivityStorageError)) throw error;
+          return send(
+            response,
+            422,
+            JSON.stringify({ code: error.code, message: error.message }),
+            "application/json; charset=utf-8",
+          );
+        }
+      }
+      if (request.method === "GET" && relative.startsWith("extension/")) {
+        if (!authorized(request)) return send(response, 401, "Authentication required");
+        const match = /^extension\/([0-9a-f-]{36})\/([a-z0-9]+(?:[.-][a-z0-9]+)*)\.mjs$/u.exec(
+          relative,
+        );
+        if (match === null) return send(response, 404, "Not found");
+        const sessionId = parseSessionId(match[1]);
+        const extensionId = parseExtensionId(match[2], "extensionId");
+        const inventory = await withArtifactClient((client) =>
+          client.listExtensions({ sessionId }),
+        );
+        const entry = inventory.extensions.find((item) => item.id === extensionId);
+        if (entry?.enabled !== true || entry.webPath === undefined)
+          return send(response, 404, "Not found");
+        if ((await realpath(entry.webPath)) !== entry.webPath)
+          throw new Error(`Extension ${extensionId} web entry changed since discovery`);
+        const details = await stat(entry.webPath);
+        if (!details.isFile() || details.size > 1_000_000)
+          throw new Error(`Extension ${extensionId} web entry is not a bounded file`);
+        const data = await readFile(entry.webPath);
+        if (data.byteLength > 1_000_000)
+          throw new Error(`Extension ${extensionId} web entry exceeds the size limit`);
+        response.writeHead(200, {
+          ...SECURITY_HEADERS,
+          "content-type": "text/javascript; charset=utf-8",
+        });
+        return response.end(data);
       }
       if (request.method !== "GET") return send(response, 405, "Method not allowed");
       const file = relative === "" ? "index.html" : relative;
@@ -768,13 +936,21 @@ export async function startWebGateway(options: WebGatewayOptions): Promise<WebGa
       const text = data.toString();
       if (binary || Buffer.byteLength(text) > MAX_WIRE_MESSAGE_BYTES)
         return webSocket.close(1009, "Text message limit exceeded");
+      // Require exactly one NDJSON record per frame (one trailing newline, no
+      // interior newlines). Otherwise many requests could be packed into one
+      // frame and counted once, bypassing the per-record rate limits before the
+      // frame is written verbatim to the daemon socket.
+      if (!text.endsWith("\n") || text.indexOf("\n") !== text.length - 1)
+        return webSocket.close(1008, "One request per message required");
+      const record = text.slice(0, -1);
+      if (record === "") return webSocket.close(1008, "Empty request");
       const now = performance.now();
       if (now - windowStarted > 10_000) {
         windowStarted = now;
         messages = 0;
         workspaceDiffs = 0;
       }
-      if (isWorkspaceDiffRequest(text)) {
+      if (isWorkspaceDiffRequest(record)) {
         if (++workspaceDiffs > MAX_WORKSPACE_REVIEW_DIFFS)
           return webSocket.close(1008, "Rate limit exceeded");
       } else {
@@ -827,6 +1003,12 @@ export async function startWebGateway(options: WebGatewayOptions): Promise<WebGa
   return {
     origin: `${expectedOrigin}${prefix}`,
     launchUrl: `${expectedOrigin}${prefix}#token=${launchToken.toString("base64url")}`,
+    issueLaunchUrl: () => {
+      launchToken = randomBytes(32);
+      launchAvailable = true;
+      launchExpiresAt = Date.now() + 60_000;
+      return `${expectedOrigin}${prefix}#token=${launchToken.toString("base64url")}`;
+    },
     close: () =>
       new Promise((resolvePromise, reject) => {
         providerLogin?.controller.abort();

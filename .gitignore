@@ -4,12 +4,18 @@
 node_modules/
 dist/
 .release/
+# Read-only reference checkouts (see AGENTS.md). Never tracked.
+.reference/
 coverage/
 docs/screenshots/
 *.tsbuildinfo
 .env
 .env.*
 !.env.example
+
+# Local web-client review notes; not part of the tracked repository.
+web-client-audit.md
+web-client-tracking.md
 
 # These product plans belong in the repository even when a global ignore file hides them.
 !CODE_STRUCTURE.md

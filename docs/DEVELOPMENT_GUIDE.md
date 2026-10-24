@@ -280,7 +280,7 @@ AGENTS.md
 .axl/mcp.json
 ```
 
-Project instructions augment applicable global instructions. A project skill or MCP server replaces a global entry with the same name. Use `/reload` after changing instructions, skills, or MCP configuration for an open session.
+Project instructions augment applicable global instructions. A project Skill replaces a broader or global Skill with the same name. MCP configuration is loaded only from the user-owned `~/.axl/mcp.json`. Use `/reload` after changing instructions, Skills, or MCP configuration for an open session.
 
 Do not commit secrets. Configuration entries reference environment variable names rather than embedding credential values.
 
@@ -594,6 +594,27 @@ Focused check:
 
 ```bash
 node --test packages/extensions/skills/test/*.test.ts
+```
+
+### `@axl/extension-host`
+
+Location: `packages/extensions/host`
+
+Responsibilities:
+
+- discovery of user daemon extensions in `~/.axl/extensions/`;
+- importing `.ts` and `.js` extension modules into the daemon process;
+- the `DaemonExtensionApi` implementation: `registerTool`, `on("tool.call")`, `on("command")`, `on("session.event")`, and `track`;
+- JSON Schema validation before extension tool execution;
+- indexing extension tools as capabilities behind `capability_search`; and
+- one kernel `ExtensionHost` that gates tool and command calls, forwards durable events, drains asynchronous observers, and disposes tracked resources.
+
+Extensions run with the daemon's permissions and are trusted by placement. An invalid extension fails session start with its path and reason. A gate that throws blocks the tool call. Changed source is re-imported at the next runtime reload. See [`docs/extensions.md`](extensions.md).
+
+Focused check:
+
+```bash
+node --test packages/extensions/host/test/*.test.ts
 ```
 
 ### `@axl/extension-mcp`

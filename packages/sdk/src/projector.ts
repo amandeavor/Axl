@@ -1,9 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Hari Srinivasan
 // SPDX-FileCopyrightText: 2026 VishnuM449
+// SPDX-FileCopyrightText: 2026 Shaan Narendran
 // SPDX-License-Identifier: Apache-2.0
 
 import type {
   CanonicalEvent,
+  ContextResource,
   EventId,
   EventPayloadMap,
   JsonObject,
@@ -52,6 +54,10 @@ export interface ProjectedInteraction {
   readonly resolution?: CanonicalEvent<"interaction.resolved">;
 }
 
+export type ProjectedCapabilitySearch = CanonicalEvent<"capability.searched">;
+export type ProjectedActiveCapability = CanonicalEvent<"capability.activated">;
+export type ProjectedCapabilityDenial = CanonicalEvent<"capability.denied">;
+
 export interface ProjectedActivity {
   readonly operationId: OperationId;
   readonly sequence: number;
@@ -67,7 +73,13 @@ export interface UsageTotals extends Usage {
 
 export interface ProjectedOperation {
   readonly operationId: OperationId;
-  readonly status: "running" | "waiting_interaction" | "succeeded" | "failed" | "aborted";
+  readonly status:
+    | "queued"
+    | "running"
+    | "waiting_interaction"
+    | "succeeded"
+    | "failed"
+    | "aborted";
 }
 
 export interface UncertainShellOperation {
@@ -99,6 +111,9 @@ export interface ConversationState {
   readonly compactedEventIds: readonly EventId[];
   readonly tools: readonly ProjectedToolCall[];
   readonly interactions: readonly ProjectedInteraction[];
+  readonly capabilitySearches: readonly ProjectedCapabilitySearch[];
+  readonly activeCapabilities: readonly ProjectedActiveCapability[];
+  readonly capabilityDenials: readonly ProjectedCapabilityDenial[];
   readonly operations: readonly ProjectedOperation[];
   readonly activeOperationId?: OperationId;
   readonly uncertainShellOperations: readonly UncertainShellOperation[];
@@ -109,10 +124,13 @@ export interface ConversationState {
   readonly entitlement?: string;
   readonly thinking?: ThinkingLevel;
   readonly requestSettings?: EventPayloadMap["config.request"];
+  readonly compactionSettings?: EventPayloadMap["config.compaction"];
   readonly lastRequest?: EventPayloadMap["model.request_configured"];
   readonly profile?: SessionProfile;
   readonly webFetch?: boolean;
   readonly webSearch?: boolean;
+  readonly userQuestions?: boolean;
+  readonly contextResources: readonly ContextResource[];
   readonly sandbox?: { readonly provider: string; readonly enforced: boolean };
   readonly usage: UsageTotals;
   readonly activity?: ProjectedActivity;
@@ -128,6 +146,9 @@ export type ConversationOverview = Omit<
   | "compactedEventIds"
   | "tools"
   | "interactions"
+  | "capabilitySearches"
+  | "activeCapabilities"
+  | "capabilityDenials"
   | "operations"
   | "queue"
   | "interruptDeliveries"
@@ -176,7 +197,7 @@ function renderIntent(name: string): ProjectedToolCall["renderIntent"] {
   }
   if (normalized.includes("search") || normalized.includes("grep")) return "search";
   if (normalized.includes("web") || normalized.includes("fetch")) return "web";
-  if (normalized.startsWith("mcp") || normalized.includes("__")) return "mcp";
+  if (normalized.startsWith("mcp_")) return "mcp";
   if (normalized.includes("workflow")) return "workflow";
   return "generic";
 }
@@ -208,6 +229,9 @@ export class ConversationProjector {
   private readonly events = new Map<string, string>();
   private readonly tools = new Map<string, ProjectedToolCall>();
   private readonly interactions = new Map<string, ProjectedInteraction>();
+  private readonly capabilitySearches: ProjectedCapabilitySearch[] = [];
+  private readonly activeCapabilities = new Map<string, ProjectedActiveCapability>();
+  private readonly capabilityDenials: ProjectedCapabilityDenial[] = [];
   private readonly operations = new Map<OperationId, ProjectedOperation>();
   private readonly uncertainShellOperations = new Map<OperationId, UncertainShellOperation>();
   private readonly queue = new Map<EventId, ProjectedQueueItem>();
@@ -218,10 +242,13 @@ export class ConversationProjector {
   private entitlement: string | undefined;
   private thinking: ThinkingLevel | undefined;
   private requestSettings: EventPayloadMap["config.request"] | undefined;
+  private compactionSettings: EventPayloadMap["config.compaction"] | undefined;
   private lastRequest: EventPayloadMap["model.request_configured"] | undefined;
   private profile: SessionProfile | undefined;
   private webFetch: boolean | undefined;
   private webSearch: boolean | undefined;
+  private userQuestions: boolean | undefined;
+  private contextResources: readonly ContextResource[] = [];
   private sandbox: ConversationState["sandbox"];
   private usage: UsageTotals = EMPTY_USAGE;
   private activity: ProjectedActivity | undefined;
@@ -251,6 +278,9 @@ export class ConversationProjector {
       compactedEventIds: Object.freeze([...this.compactedEvents]),
       tools: Object.freeze([...this.tools.values()]),
       interactions: Object.freeze([...this.interactions.values()]),
+      capabilitySearches: Object.freeze([...this.capabilitySearches]),
+      activeCapabilities: Object.freeze([...this.activeCapabilities.values()]),
+      capabilityDenials: Object.freeze([...this.capabilityDenials]),
       operations: Object.freeze([...this.operations.values()]),
       uncertainShellOperations: Object.freeze([...this.uncertainShellOperations.values()]),
       queue: Object.freeze([...this.queue.values()]),
@@ -270,11 +300,16 @@ export class ConversationProjector {
       ...(this.provider === undefined ? {} : { provider: this.provider }),
       ...(this.entitlement === undefined ? {} : { entitlement: this.entitlement }),
       ...(this.requestSettings === undefined ? {} : { requestSettings: this.requestSettings }),
+      ...(this.compactionSettings === undefined
+        ? {}
+        : { compactionSettings: this.compactionSettings }),
       ...(this.lastRequest === undefined ? {} : { lastRequest: this.lastRequest }),
       ...(this.thinking === undefined ? {} : { thinking: this.thinking }),
       ...(this.profile === undefined ? {} : { profile: this.profile }),
       ...(this.webFetch === undefined ? {} : { webFetch: this.webFetch }),
       ...(this.webSearch === undefined ? {} : { webSearch: this.webSearch }),
+      ...(this.userQuestions === undefined ? {} : { userQuestions: this.userQuestions }),
+      contextResources: this.contextResources,
       ...(this.sandbox === undefined ? {} : { sandbox: this.sandbox }),
       usage: this.usage,
       ...(this.activity === undefined ? {} : { activity: this.activity }),
@@ -302,6 +337,9 @@ export class ConversationProjector {
     this.events.clear();
     this.tools.clear();
     this.interactions.clear();
+    this.capabilitySearches.length = 0;
+    this.activeCapabilities.clear();
+    this.capabilityDenials.length = 0;
     this.operations.clear();
     this.activeOperationId = undefined;
     if (!keepUncertainShells) this.uncertainShellOperations.clear();
@@ -312,10 +350,13 @@ export class ConversationProjector {
     this.entitlement = undefined;
     this.thinking = undefined;
     this.requestSettings = undefined;
+    this.compactionSettings = undefined;
     this.lastRequest = undefined;
     this.profile = undefined;
     this.webFetch = undefined;
     this.webSearch = undefined;
+    this.userQuestions = undefined;
+    this.contextResources = [];
     this.sandbox = undefined;
     this.usage = EMPTY_USAGE;
     this.activity = undefined;
@@ -491,9 +532,20 @@ export class ConversationProjector {
           );
         }
         this.interactions.set(event.payload.interactionId, { ...interaction, resolution: event });
-        this.updateOperation(event.operationId, "running");
+        // The resolution is recorded under the responding RPC's operation for idempotency.
+        // The operation that resumes is the one that asked.
+        this.updateOperation(interaction.request.operationId ?? event.operationId, "running");
         break;
       }
+      case "capability.searched":
+        this.capabilitySearches.push(event);
+        break;
+      case "capability.activated":
+        this.activeCapabilities.set(event.payload.capability.identity, event);
+        break;
+      case "capability.denied":
+        this.capabilityDenials.push(event);
+        break;
       case "config.model":
         this.model = event.payload.modelId;
         break;
@@ -505,6 +557,9 @@ export class ConversationProjector {
         break;
       case "config.request":
         this.requestSettings = event.payload;
+        break;
+      case "config.compaction":
+        this.compactionSettings = event.payload;
         break;
       case "model.request_configured":
         this.lastRequest = event.payload;
@@ -518,6 +573,10 @@ export class ConversationProjector {
       case "config.tools":
         this.webFetch = event.payload.webFetch;
         this.webSearch = event.payload.webSearch;
+        this.userQuestions = event.payload.userQuestions ?? false;
+        break;
+      case "context.resources":
+        this.contextResources = event.payload.resources;
         break;
       case "sandbox.configured":
         this.sandbox = { provider: event.payload.provider, enforced: event.payload.enforced };
@@ -538,10 +597,33 @@ export class ConversationProjector {
           this.clearActivity(event.operationId);
         }
         break;
+      case "compaction.queued":
+        this.updateOperation(event.operationId, "queued");
+        break;
+      case "compaction.started":
+        this.updateOperation(event.operationId, "running");
+        break;
+      case "compaction.failed":
+        if (event.payload.willRetry || event.payload.reason !== "manual") {
+          this.updateOperation(event.operationId, "running");
+        } else {
+          this.updateOperation(event.operationId, "failed");
+          this.clearActivity(event.operationId);
+        }
+        break;
       case "context.compacted":
         this.usage = addUsage(this.usage, event.payload.usage);
         this.lastCompaction = event;
         for (const id of event.payload.replacedEventIds) this.compactedEvents.add(id);
+        this.updateOperation(
+          event.operationId,
+          event.payload.reason === undefined || event.payload.reason === "manual"
+            ? "succeeded"
+            : "running",
+        );
+        if (event.payload.reason === undefined || event.payload.reason === "manual") {
+          this.clearActivity(event.operationId);
+        }
         break;
       case "session.error":
         this.lastError = event;
@@ -648,6 +730,8 @@ export class ConversationProjector {
             sequence: frame.sequence,
             toolCalls: [...base.toolCalls, frame.call],
           };
+    } else if (frame.type === "tool_progress") {
+      this.activity = { ...base, sequence: frame.sequence };
     }
     return true;
   }

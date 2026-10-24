@@ -6,6 +6,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import assert from "node:assert/strict";
+import { existsSync, readFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,19 +15,22 @@ import test, { type TestContext } from "node:test";
 
 import {
   AxlDaemon,
+  type ExtensionManagementService,
   type ProviderManagementService,
   type SessionInteractionRequest,
 } from "@axl/daemon";
-import type { TerminalExtension } from "@axl/extension-api";
+import type { ActivityInput, TerminalExtension } from "@axl/extension-api";
 import {
   type CompactionSettings,
   type ModelPort,
   type ModelTurnRequest,
+  makeAskUserQuestionTool,
   ToolRegistry,
 } from "@axl/kernel";
 import type {
   CanonicalEvent,
   EventPayloadMap,
+  ExtensionListResult,
   JsonObject,
   ModelStreamEvent,
   SessionId,
@@ -36,7 +40,7 @@ import { DEFAULT_MODEL_REQUEST_SETTINGS } from "@axl/protocol";
 import { AxlClientError, subscribeSession, type TrustedProviderHost } from "@axl/sdk";
 import { connectUnixClient, createUnixDaemonHost } from "@axl/sdk/unix";
 
-import { AxlApp, saveClipboardImage, stripAnsi } from "../src/index.ts";
+import { AxlApp, loadTerminalExtensions, saveClipboardImage, stripAnsi } from "../src/index.ts";
 import { VirtualTerminal } from "./virtual-terminal.ts";
 
 class PassThrough extends NodePassThrough {
@@ -75,6 +79,7 @@ async function startStack(
   sandbox?: EventPayloadMap["sandbox.configured"],
   compaction?: Partial<CompactionSettings>,
   providerManagement?: ProviderManagementService,
+  extensionManagement?: ExtensionManagementService,
 ) {
   const directory = await mkdtemp(join(tmpdir(), "axl-tui-"));
   const socketPath = join(directory, "axl.sock");
@@ -82,6 +87,7 @@ async function startStack(
     socketPath,
     dataDirectory: join(directory, "data"),
     ...(providerManagement === undefined ? {} : { providerManagement }),
+    ...(extensionManagement === undefined ? {} : { extensionManagement }),
     runtime: ({ selection, interact }) => ({
       model,
       configRequest: selection.requestSettings ?? DEFAULT_MODEL_REQUEST_SETTINGS,
@@ -124,6 +130,23 @@ function captureOutput(): {
     text += chunk.toString("utf8");
   });
   return { output, text: () => text };
+}
+
+async function screenshotTerminal(text: string, name: string): Promise<void> {
+  const destination = process.env.AXL_TUI_SCREENSHOT_DIR;
+  if (destination === undefined) return;
+  await mkdir(destination, { recursive: true });
+  const terminal = new VirtualTerminal(100, 24);
+  terminal.write(text);
+  const rows = terminal.rows().slice(-24);
+  const escapeXml = (value: string) =>
+    value
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;");
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="960" height="480" viewBox="0 0 960 480"><rect width="960" height="480" fill="#10151b"/><g fill="#e4e8ef" font-family="DejaVu Sans Mono,monospace" font-size="15">${rows.map((row, index) => `<text x="16" y="${26 + index * 19}">${escapeXml(row)}</text>`).join("")}</g></svg>`;
+  await writeFile(join(destination, `${name}.svg`), svg);
 }
 
 function until(predicate: () => boolean, label: string): Promise<void> {
@@ -606,7 +629,7 @@ test("/compact summarizes older context through the daemon", async (context) => 
   };
   const { socketPath, directory } = await startStack(context, model, undefined, undefined, {
     keepRecentTokens: 7,
-    maxOutputTokens: 123,
+    reserveTokens: 154,
   });
   const input = new PassThrough();
   const { output, text } = captureOutput();
@@ -1350,6 +1373,571 @@ for (const submission of ["local", "other attachment"] as const) {
   }
 }
 
+test("a fake activity shows live agent work and stays open on completion", async (context) => {
+  let release!: () => void;
+  let began = false;
+  let turns = 0;
+  const gate = new Promise<void>((resolvePromise) => {
+    release = resolvePromise;
+  });
+  const model: ModelPort = {
+    stream() {
+      turns += 1;
+      const turn = turns;
+      return (async function* (): AsyncGenerator<ModelStreamEvent> {
+        if (turn === 1) {
+          yield { type: "tool_call", callId: "activity-tool", name: "echo", input: {} };
+          yield { type: "completed", stopReason: "tool_use", usage };
+          return;
+        }
+        yield { type: "text_delta", text: "activity work complete" };
+        yield { type: "completed", stopReason: "stop", usage };
+      })();
+    },
+  };
+  const keys: string[] = [];
+  const pauses: string[] = [];
+  let help = false;
+  let disposals = 0;
+  const extension: TerminalExtension = {
+    manifest: {
+      id: "test.activity-host",
+      name: "Activity host",
+      capabilities: ["terminal.activities"],
+    },
+    activate(api) {
+      api.registerActivity({
+        id: "test.fake-game",
+        name: "Fake Game",
+        description: "TUI activity fixture",
+        category: "game",
+        create: () => ({
+          render: () => ({
+            lines: [[{ text: help ? "FAKE HELP" : "FAKE ACTIVITY", style: "accent" }]],
+          }),
+          handleInput: (input) => {
+            if (input.type === "key") {
+              keys.push(input.key);
+              if (input.key === "?") help = !help;
+            }
+          },
+          pause: (reason) => pauses.push(reason),
+          resume: () => undefined,
+          serialize: () => ({ keys: keys.length }),
+          dispose: () => {
+            disposals += 1;
+          },
+        }),
+      });
+    },
+  };
+  const { socketPath, directory } = await startStack(context, model, () => {
+    const tools = new ToolRegistry();
+    tools.register({
+      name: "echo",
+      description: "Wait while the activity remains interactive",
+      inputSchema: { type: "object" },
+      execute: async () => {
+        began = true;
+        await gate;
+        return { content: [{ type: "text", text: "tool complete" }], isError: false };
+      },
+    });
+    return tools;
+  });
+  const input = new PassThrough();
+  const { output, text } = captureOutput();
+  const app = await AxlApp.start({
+    client: await connectUnixClient(socketPath),
+    input,
+    output,
+    cwd: directory,
+    color: false,
+    extensions: [extension],
+  });
+  context.after(() => app.stop());
+
+  input.write("work\r");
+  await until(() => began, "long-running activity fixture");
+  input.write("/play\r");
+  await until(() => text().includes("FAKE ACTIVITY"), "active activity");
+  const agentRows = (
+    app as unknown as { activityAgentRows(width: number): readonly { readonly text: string }[] }
+  ).activityAgentRows(48);
+  assert.ok(agentRows.some(({ text: row }) => row.toLowerCase().includes("echo")));
+  assert.ok(agentRows.every(({ text: row }) => stripAnsi(row).length <= 48));
+  input.write("?");
+  await until(() => text().includes("FAKE HELP"), "activity help through composed TUI");
+  input.write("?");
+  await until(() => text().includes("FAKE ACTIVITY"), "activity help return");
+  input.write("\t\x0f");
+  await until(
+    () =>
+      (app as unknown as { view: { toolOutputDisplay: string } }).view.toolOutputDisplay === "full",
+    "Agent pane tool details",
+  );
+  const loungeInternals = app as unknown as {
+    editor: { readonly text: string };
+    activitySurface: { readonly state: string; readonly agentFocused: boolean };
+  };
+  input.write("/he\t");
+  await until(() => loungeInternals.editor.text === "/help", "Agent completion owns Tab");
+  assert.equal(loungeInternals.activitySurface.agentFocused, true);
+  input.write("\x15draft in Lounge");
+  await until(() => loungeInternals.editor.text === "draft in Lounge", "shared Lounge draft");
+  input.write("\t");
+  assert.equal(loungeInternals.activitySurface.agentFocused, false);
+  assert.equal(loungeInternals.editor.text, "draft in Lounge");
+  input.write("z");
+  await until(() => keys.includes("z"), "isolated activity input");
+  release();
+  await until(() => text().includes("activity work complete"), "daemon completion");
+  await until(() => text().includes("Axl finished"), "non-blocking completion notice");
+  assert.equal(
+    (app as unknown as { activitySurface: { state: string } }).activitySurface.state,
+    "active",
+  );
+  assert.equal(disposals, 0);
+  assert.deepEqual(pauses, []);
+  input.write("\t\r");
+  await until(() => turns >= 3, "prompt submitted from Lounge Agent pane");
+  assert.equal(loungeInternals.activitySurface.state, "active");
+  assert.equal(loungeInternals.editor.text, "");
+
+  input.write("/settings\r");
+  await until(() => text().includes("Terminal settings"), "Lounge settings takeover");
+  assert.equal(loungeInternals.activitySurface.agentFocused, true);
+  input.write("\x1b");
+  await until(() => text().includes("FAKE ACTIVITY"), "Lounge settings return");
+  assert.equal(loungeInternals.activitySurface.state, "active");
+  assert.equal(loungeInternals.activitySurface.agentFocused, true);
+
+  input.write("/review\r\x1b");
+  await until(() => text().includes("Workspace review"), "Lounge review takeover");
+  await until(() => text().includes("FAKE ACTIVITY"), "cancelled Lounge review return");
+  assert.equal(loungeInternals.activitySurface.state, "active");
+  assert.equal(loungeInternals.activitySurface.agentFocused, true);
+
+  input.write("\x14");
+  await until(
+    () =>
+      (app as unknown as { activitySurface: { state: string } }).activitySurface.state === "closed",
+    "explicit transcript return",
+  );
+});
+
+test("activities stay available after the host replaces the extension set", async (context) => {
+  const extension: TerminalExtension = {
+    manifest: {
+      id: "test.replaced-host",
+      name: "Replaced host",
+      capabilities: ["terminal.activities"],
+    },
+    activate(api) {
+      api.registerActivity({
+        id: "test.replaced-game",
+        name: "Replaced Game",
+        description: "Registered through the replaced extension host",
+        category: "game",
+        create: () => ({
+          render: () => ({ lines: [[{ text: "REPLACED ACTIVITY", style: "accent" }]] }),
+          handleInput: () => undefined,
+          pause: () => undefined,
+          resume: () => undefined,
+          serialize: () => undefined,
+          dispose: () => undefined,
+        }),
+      });
+    },
+  };
+  const { socketPath, directory } = await startStack(context);
+  const input = new PassThrough();
+  const { output, text } = captureOutput();
+  const app = await AxlApp.start({
+    client: await connectUnixClient(socketPath),
+    input,
+    output,
+    cwd: directory,
+    color: false,
+    extensions: [extension],
+    loadExtensions: async () => [],
+  });
+  context.after(() => app.stop());
+  input.write("/play\r");
+  await until(() => text().includes("REPLACED ACTIVITY"), "activity from the replaced host");
+});
+
+test("Ctrl+P keeps the wide Agent pane live and returns to the same activity", async (context) => {
+  const { socketPath, directory } = await startStack(context);
+  const input = new PassThrough();
+  const { output, text } = captureOutput();
+  output.columns = 120;
+  output.rows = 30;
+  let firstCreations = 0;
+  let firstDisposals = 0;
+  const activityMouseInputs: ActivityInput[] = [];
+  const extension: TerminalExtension = {
+    manifest: {
+      id: "test.library-app",
+      name: "Library app",
+      capabilities: ["terminal.activities"],
+    },
+    activate(api) {
+      for (const [id, name] of [
+        ["test.library-first", "First Library Game"],
+        ["test.library-second", "Second Library Game"],
+      ] as const) {
+        api.registerActivity({
+          id,
+          name,
+          description: `${name} fixture`,
+          category: "game",
+          mouse: true,
+          create: () => {
+            if (id === "test.library-first") firstCreations += 1;
+            return {
+              render: () => ({ lines: [[{ text: `${name} BOARD`, style: "accent" }]] }),
+              handleInput: (activityInput) => {
+                if (activityInput.type === "mouse") activityMouseInputs.push(activityInput);
+              },
+              pause: () => undefined,
+              resume: () => undefined,
+              serialize: () => ({ id }),
+              dispose: () => {
+                if (id === "test.library-first") firstDisposals += 1;
+              },
+            };
+          },
+        });
+      }
+    },
+  };
+  const app = await AxlApp.start({
+    client: await connectUnixClient(socketPath),
+    input,
+    output,
+    cwd: directory,
+    color: false,
+    extensions: [extension],
+  });
+  context.after(() => app.stop());
+
+  input.write("/play\r");
+  await until(() => text().includes("Axl Lounge · Games"), "game library");
+  input.write("\r");
+  await until(() => text().includes("First Library Game BOARD"), "first library game");
+  assert.equal(firstCreations, 1);
+  assert.equal(text().includes("\x1b[?1000h"), true);
+  input.write("\x1b[<0;67;15M");
+  await until(() => activityMouseInputs.length === 1, "activity mouse input");
+  assert.deepEqual(activityMouseInputs[0], {
+    type: "mouse",
+    phase: "press",
+    button: "left",
+    row: 0,
+    column: 0,
+    ctrl: false,
+    alt: false,
+    shift: false,
+  });
+  input.write("\x10");
+  await until(
+    () => text().includes("Axl Lounge · Games") && text().includes("Agent · idle"),
+    "wide right-pane library",
+  );
+  assert.equal(firstCreations, 1);
+  assert.equal(firstDisposals, 0);
+
+  input.write("\t/he\t");
+  await until(
+    () => (app as unknown as { editor: { text: string } }).editor.text === "/help",
+    "Agent completion beside library",
+  );
+  assert.equal(
+    (app as unknown as { activitySurface: { agentFocused: boolean } }).activitySurface.agentFocused,
+    true,
+  );
+  input.write("\x15wide picker draft");
+  await until(
+    () => (app as unknown as { editor: { text: string } }).editor.text === "wide picker draft",
+    "Agent input beside library",
+  );
+  input.write("\x10");
+  await until(() => text().includes("First Library Game BOARD"), "return from library");
+  assert.equal(firstCreations, 1);
+  assert.equal(firstDisposals, 0);
+  assert.equal((app as unknown as { editor: { text: string } }).editor.text, "wide picker draft");
+  input.write("\x14");
+  await until(() => text().includes("\x1b[?1000l"), "activity mouse capture cleanup");
+});
+
+test("supported interaction preempts Lounge before another game key can run", async (context) => {
+  let release!: () => void;
+  let toolBegan = false;
+  const gate = new Promise<void>((resolvePromise) => {
+    release = resolvePromise;
+  });
+  let turn = 0;
+  const model: ModelPort = {
+    stream() {
+      turn += 1;
+      return (async function* (): AsyncGenerator<ModelStreamEvent> {
+        if (turn === 1) {
+          yield { type: "tool_call", callId: "attention", name: "attention", input: {} };
+          yield { type: "completed", stopReason: "tool_use", usage };
+          return;
+        }
+        yield { type: "text_delta", text: "attention complete" };
+        yield { type: "completed", stopReason: "stop", usage };
+      })();
+    },
+  };
+  const keys: string[] = [];
+  const pauses: string[] = [];
+  const extension: TerminalExtension = {
+    manifest: { id: "test.preempt", name: "Preempt", capabilities: ["terminal.activities"] },
+    activate(api) {
+      api.registerActivity({
+        id: "test.preempt-game",
+        name: "Preempt game",
+        description: "Attention preemption fixture",
+        category: "game",
+        create: () => ({
+          render: () => ({ lines: [[{ text: "PREEMPT GAME", style: "text" }]] }),
+          handleInput: (activityInput) => {
+            if (activityInput.type === "key") keys.push(activityInput.key);
+          },
+          pause: (reason) => pauses.push(reason),
+          resume: () => undefined,
+          serialize: () => undefined,
+          dispose: () => undefined,
+        }),
+      });
+    },
+  };
+  const { socketPath, directory } = await startStack(context, model, (interact) => {
+    const tools = new ToolRegistry();
+    tools.register({
+      name: "attention",
+      description: "Wait, then request attention",
+      inputSchema: { type: "object" },
+      async execute(_input, signal) {
+        toolBegan = true;
+        await gate;
+        const response = await interact(
+          { kind: "mcp_tool", source: "mcp:fixture", message: "Allow attention fixture?" },
+          signal,
+        );
+        return {
+          content: [{ type: "text", text: response.action }],
+          isError: response.action !== "accept",
+        };
+      },
+    });
+    return tools;
+  });
+  const input = new PassThrough();
+  const { output, text } = captureOutput();
+  const app = await AxlApp.start({
+    client: await connectUnixClient(socketPath),
+    input,
+    output,
+    cwd: directory,
+    color: false,
+    extensions: [extension],
+  });
+  context.after(() => app.stop());
+
+  input.write("work\r");
+  await until(() => toolBegan, "attention tool start");
+  input.write("/lounge\r");
+  await until(() => text().includes("PREEMPT GAME"), "attention fixture activity");
+  input.write("a");
+  await until(() => keys.length === 1, "initial game key");
+  release();
+  await until(() => text().includes("Allow attention fixture?"), "attention overlay");
+  assert.deepEqual(pauses, ["attention"]);
+  assert.equal(
+    (app as unknown as { activitySurface: { state: string } }).activitySurface.state,
+    "suspended",
+  );
+  input.write("y");
+  await until(
+    () => (app as unknown as { activeInteractionId?: string }).activeInteractionId === undefined,
+    "attention response",
+  );
+  assert.deepEqual(keys, ["a"]);
+});
+
+test("closing Lounge preserves draft, selection, attachments, transcript scroll, and display mode", async (context) => {
+  const { socketPath, directory } = await startStack(context);
+  const input = new PassThrough();
+  const { output } = captureOutput();
+  const extension: TerminalExtension = {
+    manifest: { id: "test.return", name: "Return", capabilities: ["terminal.activities"] },
+    activate(api) {
+      api.registerActivity({
+        id: "test.return-game",
+        name: "Return game",
+        description: "Context return fixture",
+        category: "game",
+        create: () => ({
+          render: () => ({ lines: [[{ text: "RETURN GAME", style: "text" }]] }),
+          handleInput: () => undefined,
+          pause: () => undefined,
+          resume: () => undefined,
+          serialize: () => undefined,
+          dispose: () => undefined,
+        }),
+      });
+    },
+  };
+  const app = await AxlApp.start({
+    client: await connectUnixClient(socketPath),
+    input,
+    output,
+    cwd: directory,
+    color: false,
+    tuiMode: "fullscreen",
+    extensions: [extension],
+  });
+  context.after(() => app.stop());
+  const internals = app as unknown as {
+    editor: { text: string; selectedText: string; setText(value: string): void; selectAll(): void };
+    pendingAttachments: unknown[];
+    tuiMode: "regular" | "fullscreen";
+    fullscreen: { scrollTop: number; following: boolean };
+    activitySurface: { readonly state: string; open(id: string): void; close(): void };
+  };
+  internals.editor.setText("preserved draft");
+  internals.editor.selectAll();
+  const attachment = { id: "preserved-attachment" };
+  internals.pendingAttachments.push(attachment);
+  internals.fullscreen.following = false;
+  internals.fullscreen.scrollTop = 7;
+
+  internals.activitySurface.open("test.return-game");
+  internals.activitySurface.close();
+
+  assert.equal(internals.editor.text, "preserved draft");
+  assert.equal(internals.editor.selectedText, "preserved draft");
+  assert.deepEqual(internals.pendingAttachments, [attachment]);
+  assert.equal(internals.fullscreen.scrollTop, 7);
+  assert.equal(internals.fullscreen.following, false);
+  assert.equal(internals.tuiMode, "fullscreen");
+
+  input.write("\x1b[O\x1b[I");
+  await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
+  assert.equal(internals.activitySurface.state, "closed");
+});
+
+test("generic settings enable and disable Lounge without disabled activity work", async (context) => {
+  const { socketPath, directory } = await startStack(context);
+  const input = new PassThrough();
+  const { output, text } = captureOutput();
+  let activations = 0;
+  let creations = 0;
+  let disposals = 0;
+  let storageReads = 0;
+  let preferenceLoads = 0;
+  const preferences: Array<Record<string, unknown>> = [];
+  const extension: TerminalExtension = {
+    manifest: {
+      id: "test.lounge-toggle",
+      name: "Lounge toggle fixture",
+      capabilities: ["terminal.activities", "terminal.activity-storage"],
+    },
+    activate(api) {
+      activations += 1;
+      api.registerActivity({
+        id: "test.toggle-game",
+        name: "Toggle Game",
+        description: "Disabled Lounge fixture",
+        category: "game",
+        create(activity) {
+          creations += 1;
+          activity.schedule(10_000, () => undefined);
+          return {
+            render: () => ({ lines: [[{ text: "TOGGLE ACTIVITY", style: "accent" }]] }),
+            handleInput: () => undefined,
+            pause: () => undefined,
+            resume: () => undefined,
+            serialize: () => ({ paused: true }),
+            dispose: () => {
+              disposals += 1;
+            },
+          };
+        },
+      });
+    },
+  };
+  const app = await AxlApp.start({
+    client: await connectUnixClient(socketPath),
+    input,
+    output,
+    cwd: directory,
+    color: false,
+    extensions: [extension],
+    loungeEnabled: false,
+    loungeExtensionIds: ["test.lounge-toggle"],
+    activityStorage: {
+      read: () => {
+        storageReads += 1;
+        return Promise.resolve(undefined);
+      },
+      write: () => Promise.reject(new Error("unexpected storage write")),
+      reset: () => Promise.reject(new Error("unexpected storage reset")),
+    },
+    loadLoungePreferences: () => {
+      preferenceLoads += 1;
+      return Promise.resolve({ reducedMotion: true, textOnly: true });
+    },
+    onPreferenceChange: (update) => {
+      preferences.push(update);
+    },
+  });
+  context.after(() => app.stop());
+
+  assert.equal(activations, 0);
+  assert.equal(storageReads, 0);
+  input.write("/lounge\r");
+  await until(() => text().includes("unknown command /lounge"), "disabled Lounge command");
+  input.write("/settings\r");
+  await until(() => text().includes("Terminal settings"), "settings surface");
+  input.write("\x1b[B".repeat(13));
+  input.write("\r");
+  await until(
+    () => stripAnsi(text()).includes("enable Lounge commands and activities"),
+    "Lounge toggle",
+  );
+  input.write("\x1b[A\r");
+  await until(() => activations === 1, "Lounge activation");
+  assert.equal(preferenceLoads, 1);
+  assert.deepEqual(preferences.at(-1), { loungeEnabled: true });
+
+  input.write("/lounge\r");
+  await until(() => text().includes("TOGGLE ACTIVITY"), "enabled Lounge activity");
+  assert.equal(creations, 1);
+  assert.equal(storageReads, 0);
+  input.write("\x1b");
+  await until(
+    () =>
+      (app as unknown as { activitySurface: { state: string } }).activitySurface.state === "closed",
+    "closed Lounge activity",
+  );
+  await (app as unknown as { setLoungeEnabled(enabled: boolean): Promise<void> }).setLoungeEnabled(
+    false,
+  );
+  await until(() => disposals === 1, "Lounge cleanup");
+  assert.deepEqual(preferences.at(-1), { loungeEnabled: false });
+  assert.equal(storageReads, 0);
+  input.write("/lounge\r");
+  await until(
+    () => (text().match(/unknown command \/lounge/g) ?? []).length === 2,
+    "disabled Lounge command after toggle",
+  );
+});
+
 test("terminal extensions cannot replace encoded safety shortcuts", async (context) => {
   const { socketPath, directory } = await startStack(context);
   const input = new PassThrough();
@@ -1480,6 +2068,116 @@ test("terminal extensions contribute UI and reload without leaking owned resourc
   await until(() => cleanups === 4, "extension shutdown cleanup");
 });
 
+test("installed TUI entry participates in a real SDK session, reloads changed source, and cleans up", async (context) => {
+  const home = await mkdtemp(join(tmpdir(), "axl-tui-installed-"));
+  context.after(() => rm(home, { recursive: true, force: true }));
+  const path = join(home, "installed.mjs");
+  const cleanup = join(home, "cleanup.txt");
+  const write = async (label: string) =>
+    writeFile(
+      path,
+      `import { appendFileSync } from "node:fs";
+export default {
+ manifest: { id: "installed", name: "Installed", capabilities: ["terminal.commands", "terminal.widgets", "terminal.status"] },
+ activate(api) {
+  api.registerCommand({ name: "installed", description: "Installed fixture", run: (_arg, ctx) => ctx.notify(${JSON.stringify(label)}) });
+  api.registerStatus("ready", { text: ${JSON.stringify(label)}, tone: "success" });
+  api.registerWidget("card", { render: () => [{ text: ${JSON.stringify(`${label} widget`)}, tone: "accent" }] });
+  return () => appendFileSync(${JSON.stringify(cleanup)}, "disposed\\n");
+ }
+};\n`,
+    );
+  await write("installed first");
+  let enabled = true;
+  const extensionManagement: ExtensionManagementService = {
+    async list(cwd): Promise<ExtensionListResult> {
+      return {
+        configPath: join(home, "extensions.json"),
+        project: { root: cwd, trusted: true },
+        commands: [],
+        extensions: [{ id: "installed", path, tuiPath: path, source: "explicit", enabled }],
+      };
+    },
+    async setEnabled(_id, value) {
+      enabled = value;
+    },
+    async install() {
+      return "installed";
+    },
+    async update() {},
+    async remove() {},
+    async trustProject() {},
+  };
+  const { socketPath, directory } = await startStack(
+    context,
+    port,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    extensionManagement,
+  );
+  const input = new PassThrough();
+  const { output, text } = captureOutput();
+  const client = await connectUnixClient(socketPath);
+  const app = await AxlApp.start({
+    client,
+    input,
+    output,
+    cwd: directory,
+    color: false,
+    loadExtensions: async (connection, sessionId) =>
+      loadTerminalExtensions(await connection.listExtensions({ sessionId })),
+  });
+  const screenshot = (name: string) => screenshotTerminal(text(), name);
+  assert.match(text(), /installed first widget/);
+  await screenshot("01-installed");
+  input.write("/installed\r");
+  await until(() => text().includes("· installed first"), "installed command");
+  await screenshot("01-command");
+  input.write("hello extension session\r");
+  await until(() => text().includes("the answer"), "provider reply in installed terminal session");
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  await screenshot("01-session-reply");
+  const eventLog = join(directory, "data", "sessions", `${app.sessionId}.jsonl`);
+  const beforeTerminalReload = await readFile(eventLog, "utf8");
+  await write("terminal-only");
+  input.write("/reload-tui\r");
+  await until(() => text().includes("terminal-only widget"), "TUI-only changed-source reload");
+  assert.equal(await readFile(eventLog, "utf8"), beforeTerminalReload);
+  assert.equal(await readFile(cleanup, "utf8"), "disposed\n");
+  await write("installed second");
+  await client.reloadExtension({ sessionId: app.sessionId, extensionId: "installed" });
+  await until(
+    () => text().includes("installed second widget"),
+    "installed source reloaded through SDK",
+  );
+  await screenshot("02-reloaded");
+  input.write("/installed\r");
+  await until(() => text().includes("installed second"), "reloaded command");
+  assert.equal(await readFile(cleanup, "utf8"), "disposed\ndisposed\n");
+  input.write("/reload\r");
+  await until(
+    () => existsSync(cleanup) && readFileSync(cleanup, "utf8") === "disposed\ndisposed\ndisposed\n",
+    "local reload cleanup",
+  );
+  await client.disableExtension({ sessionId: app.sessionId, extensionId: "installed" });
+  await until(
+    () =>
+      existsSync(cleanup) &&
+      readFileSync(cleanup, "utf8") === "disposed\ndisposed\ndisposed\ndisposed\n",
+    "disabled extension cleanup",
+  );
+  assert.equal(
+    (await client.listExtensions({ sessionId: app.sessionId })).extensions[0]?.enabled,
+    false,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 80)); // Wait for the scheduled terminal repaint.
+  await screenshot("03-disabled");
+  app.stop();
+  assert.equal(await readFile(cleanup, "utf8"), "disposed\ndisposed\ndisposed\ndisposed\n");
+});
+
 test("every TUI command has an explicit owner", async (context) => {
   const ownership = {
     daemon: [
@@ -1519,7 +2217,11 @@ test("every TUI command has an explicit owner", async (context) => {
       "help",
       "history",
       "hotkeys",
+      "lounge",
+      "play",
+      "mascot",
       "regular",
+      "reload-tui",
       "settings",
       "stash",
       "status",
@@ -1951,6 +2653,277 @@ test("Ctrl+Enter interrupts the active turn and delivers replacement input", asy
   assert.deepEqual(prompts, ["obsolete work", "do this instead"]);
 });
 
+test("ask_user_question blocks and resumes through the TUI", async (context) => {
+  let call = 0;
+  const model: ModelPort = {
+    stream() {
+      call += 1;
+      return (async function* (): AsyncGenerator<ModelStreamEvent> {
+        if (call === 1) {
+          yield {
+            type: "tool_call",
+            callId: "question",
+            name: "ask_user_question",
+            input: {
+              questions: [
+                {
+                  header: "Runtime",
+                  question: "Which runtime?",
+                  options: [
+                    { label: "Node", description: "Use Node.js", preview: "node index.js" },
+                    { label: "Bun", description: "Use Bun" },
+                  ],
+                },
+                {
+                  header: "Checks",
+                  question: "Which checks?",
+                  multiSelect: true,
+                  options: [
+                    { label: "Test", description: "Run tests" },
+                    { label: "Lint", description: "Run lint" },
+                  ],
+                },
+              ],
+            },
+          };
+          yield { type: "completed", stopReason: "tool_use", usage };
+        } else {
+          yield { type: "text_delta", text: "selected runtime" };
+          yield { type: "completed", stopReason: "stop", usage };
+        }
+      })();
+    },
+  };
+  const { socketPath, directory } = await startStack(context, model, (interact) => {
+    const tools = new ToolRegistry();
+    tools.register(makeAskUserQuestionTool(interact));
+    return tools;
+  });
+  const input = new PassThrough();
+  const { output, text } = captureOutput();
+  const app = await AxlApp.start({
+    client: await connectUnixClient(socketPath),
+    input,
+    output,
+    cwd: directory,
+    color: false,
+  });
+  context.after(() => app.stop());
+
+  input.write("ask me\r");
+  await until(() => text().includes("Which runtime?"), "question prompt");
+  assert.match(text(), /Node/);
+  input.write("\r");
+  await until(() => text().includes("Which checks?"), "multi-select prompt");
+  input.write("\r");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  input.write("\t");
+  await until(() => text().includes("Review answers"), "answer review");
+  input.write("\r");
+  await until(() => text().includes("selected runtime"), "question continuation");
+});
+
+test("the mascot stays above a question dialog, so ask can be seen", async (context) => {
+  let call = 0;
+  const model: ModelPort = {
+    stream() {
+      call += 1;
+      return (async function* (): AsyncGenerator<ModelStreamEvent> {
+        if (call === 1) {
+          yield {
+            type: "tool_call",
+            callId: "question",
+            name: "ask_user_question",
+            input: {
+              questions: [
+                {
+                  header: "Runtime",
+                  question: "Which runtime?",
+                  options: [
+                    { label: "Node", description: "Use Node.js" },
+                    { label: "Bun", description: "Use Bun" },
+                  ],
+                },
+              ],
+            },
+          };
+          yield { type: "completed", stopReason: "tool_use", usage };
+        } else {
+          yield { type: "text_delta", text: "selected runtime" };
+          yield { type: "completed", stopReason: "stop", usage };
+        }
+      })();
+    },
+  };
+  const { socketPath, directory } = await startStack(context, model, (interact) => {
+    const tools = new ToolRegistry();
+    tools.register(makeAskUserQuestionTool(interact));
+    return tools;
+  });
+  const input = new PassThrough();
+  const { output, text } = captureOutput();
+  // room for the 12-row text pack above the dialog
+  output.rows = 40;
+  const app = await AxlApp.start({
+    client: await connectUnixClient(socketPath),
+    input,
+    output,
+    cwd: directory,
+    color: false,
+    mediaCapabilities: { images: null },
+  });
+  context.after(() => app.stop());
+  const drawsMascot = (from: number) => /[▀▄]/.test(text().slice(from));
+
+  input.write("/mascot\r");
+  await until(() => drawsMascot(0), "the mascot");
+  input.write("ask me\r");
+  await until(() => text().includes("Which runtime?"), "question prompt");
+  // The dialog is up; the mascot has to keep being drawn while it waits.
+  const opened = text().length;
+  await until(() => drawsMascot(opened), "the mascot above the dialog");
+  input.write("\r");
+  await until(() => text().includes("Review answers"), "answer review");
+  input.write("\r");
+  await until(() => text().includes("selected runtime"), "question continuation");
+});
+
+test("the mascot starts on when asked and /mascot saves each change", async (context) => {
+  const { socketPath, directory } = await startStack(context);
+  const input = new PassThrough();
+  const { output, text } = captureOutput();
+  output.rows = 40;
+  const saved: Record<string, unknown>[] = [];
+  const app = await AxlApp.start({
+    client: await connectUnixClient(socketPath),
+    input,
+    output,
+    cwd: directory,
+    color: false,
+    mediaCapabilities: { images: null },
+    mascot: true,
+    mascotColour: "Purple",
+    onPreferenceChange: (update) => {
+      saved.push(update);
+    },
+  });
+  context.after(() => app.stop());
+  const mascot = () => (app as unknown as { mascot: unknown }).mascot;
+
+  await until(() => /[▀▄]/.test(text()), "the mascot, without /mascot");
+  assert.deepEqual(saved, [], "starting on is not a change to save");
+
+  input.write("/mascot\r");
+  await until(() => saved.length === 1, "off saved");
+  assert.equal(mascot(), null);
+  input.write("/mascot Albino\r");
+  await until(() => saved.length === 2, "on saved");
+  assert.deepEqual(saved, [{ mascot: false }, { mascot: true, mascotColour: "Albino" }]);
+});
+
+test("the composer's border is painted the terminal's background plus one level of blue", async (context) => {
+  const { socketPath, directory } = await startStack(context);
+  const input = new PassThrough();
+  const { output, text } = captureOutput();
+  output.rows = 40;
+  const app = await AxlApp.start({
+    client: await connectUnixClient(socketPath),
+    input,
+    output,
+    cwd: directory,
+    color: false,
+    mediaCapabilities: { images: "kitty" },
+    mascot: true,
+  });
+  context.after(() => app.stop());
+
+  await until(() => text().includes("\x1b]11;?"), "the background query");
+  input.write("\x1b]11;rgb:1c1c/1c1c/1c1c\x1b\\");
+  await until(() => text().includes("\x1b[48;2;28;28;29m"), "the border in the reported colour");
+  assert.equal(text().includes("\x1b[48;2;1;0;0m"), false);
+});
+
+test("the mascot is drawn in sixel once the terminal reports sixel and its cell size", async (context) => {
+  const { socketPath, directory } = await startStack(context);
+  const input = new PassThrough();
+  const { output, text } = captureOutput();
+  output.rows = 40;
+  const app = await AxlApp.start({
+    client: await connectUnixClient(socketPath),
+    input,
+    output,
+    cwd: directory,
+    color: false,
+    mediaCapabilities: { images: null },
+    mascot: true,
+  });
+  context.after(() => app.stop());
+  const mascot = () => (app as unknown as { mascot: { drawsSixel: boolean } | null }).mascot;
+
+  await until(() => mascot() !== null, "the mascot in glyphs");
+  assert.equal(mascot()?.drawsSixel, false);
+  // The terminal session takes both replies out of the input and reports them.
+  input.write("\x1b[?62;4c");
+  input.write("\x1b[6;20;10t");
+  await until(() => mascot()?.drawsSixel === true, "the mascot rebuilt as sixel");
+  await until(() => text().includes("\x1bP"), "a sixel frame");
+});
+
+test("a second /mascot while the first is still setting up turns it off", async (context) => {
+  const { socketPath, directory } = await startStack(context);
+  const input = new PassThrough();
+  const { output, text } = captureOutput();
+  output.rows = 40;
+  const app = await AxlApp.start({
+    client: await connectUnixClient(socketPath),
+    input,
+    output,
+    cwd: directory,
+    color: false,
+    mediaCapabilities: { images: null },
+  });
+  context.after(() => app.stop());
+  const mascot = () => (app as unknown as { mascot: unknown }).mascot;
+
+  // The first setup waits up to 400 ms for the terminal's answers.
+  input.write("/mascot\r");
+  input.write("/mascot\r");
+  await new Promise((resolve) => setTimeout(resolve, 800));
+  assert.equal(mascot(), null, "the second /mascot won");
+  assert.doesNotMatch(text(), /[▀▄]/);
+});
+
+test("a paste and a focus report are not read as the terminal's reports or as typing", async (context) => {
+  const { socketPath, directory } = await startStack(context);
+  const input = new PassThrough();
+  const { output, text } = captureOutput();
+  output.rows = 40;
+  const app = await AxlApp.start({
+    client: await connectUnixClient(socketPath),
+    input,
+    output,
+    cwd: directory,
+    color: false,
+    mediaCapabilities: { images: null },
+  });
+  context.after(() => app.stop());
+  const inner = app as unknown as {
+    terminalCellSize: unknown;
+    mascotPlayer: { state: string | null } | null;
+  };
+  input.write("/mascot\r");
+  await until(() => /[▀▄]/.test(text()), "the mascot");
+
+  input.write("\x1b[I");
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.notEqual(inner.mascotPlayer?.state, "typing", "focusing the window is not typing");
+
+  // A pasted cell-size reply is the user's text, not the terminal's answer.
+  input.write("\x1b[200~a\x1b[6;20;10tb\x1b[201~");
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(inner.terminalCellSize, undefined);
+});
+
 test("MCP interactions block the operation until the user responds", async (context) => {
   let call = 0;
   const interactiveModel: ModelPort = {
@@ -2089,6 +3062,86 @@ test("/model opens a selector and switches the model live", async (context) => {
   assert.deepEqual(preferences, [{ modelId: "gpt-4.1" }]);
   await until(() => text().includes("→ gpt-4.1"), "committed line");
   app.stop();
+});
+
+test("/model offers only models of providers that are logged in", async (context) => {
+  const provider = (providerId: string, displayName: string) => ({
+    providerId,
+    displayName,
+    enabled: true,
+    authMethods: ["environment" as const],
+    loginMethods: ["api_key" as const],
+    // The listing is stale; the status request below is what decides.
+    authentication: { providerId, phase: "idle" as const },
+    catalog: { refreshable: true },
+    models: [
+      {
+        providerId,
+        modelId: "shared-model",
+        displayName: `${displayName} Model`,
+        apiDialect: "openai-chat",
+        capabilities: { toolUse: true, structuredOutput: true, imageInput: false },
+        reasoning: false,
+        supportedThinkingLevels: ["off" as const],
+        contextWindow: 16_000,
+        maxOutputTokens: 2_000,
+        availability: { status: "available" as const },
+      },
+    ],
+  });
+  const providers = [provider("alpha", "Alpha"), provider("beta", "Beta")];
+  const service: ProviderManagementService = {
+    list: () => Promise.resolve({ providers }),
+    refresh: () => Promise.resolve({ providers: [] }),
+    authenticationStatus: () =>
+      Promise.resolve({
+        providers: [
+          { providerId: "alpha", phase: "authenticated" as const, source: "test environment" },
+          { providerId: "beta", phase: "logged_out" as const },
+        ],
+      }),
+    login: (params) => Promise.resolve({ providerId: params.providerId, phase: "authenticated" }),
+    logout: (params) => Promise.resolve({ providerId: params.providerId, phase: "logged_out" }),
+  };
+  const { socketPath, directory } = await startStack(
+    context,
+    port,
+    () => new ToolRegistry(),
+    undefined,
+    undefined,
+    service,
+  );
+  const input = new PassThrough();
+  const { output, text } = captureOutput();
+  const preferences: Array<Record<string, unknown>> = [];
+  const app = await AxlApp.start({
+    client: await connectUnixClient(socketPath),
+    input,
+    output,
+    cwd: directory,
+    color: false,
+    currentProvider: "alpha",
+    currentModel: "shared-model",
+    mediaCapabilities: { images: null },
+    onPreferenceChange: (update) => {
+      preferences.push(update);
+    },
+  });
+  context.after(() => app.stop());
+
+  input.write("/model\r");
+  await until(() => text().includes("Select model by provider"), "model selector");
+  assert.match(text(), /Alpha · Alpha Model/);
+  assert.doesNotMatch(text(), /Beta · Beta Model/);
+  input.write("\x1b");
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  input.write("/model beta/shared-model\r");
+  await until(() => text().includes("Beta is not logged in. Use /login beta"), "logged out notice");
+  assert.equal(
+    preferences.some((value) => value.providerId === "beta"),
+    false,
+  );
 });
 
 test("provider commands and /web use trusted TUI login and cancel refresh", async (context) => {
@@ -2735,6 +3788,55 @@ test("fullscreen clicks toggle one tool group without expanding the others", asy
   assert.ok(terminal.rows().some((row) => row.includes("RESULT:second.txt")));
 });
 
+test("/compact queues behind an active response", async (context) => {
+  let releaseActive = (): void => undefined;
+  const gate = new Promise<void>((resolvePromise) => {
+    releaseActive = resolvePromise;
+  });
+  let calls = 0;
+  let activeStarted = false;
+  const model: ModelPort = {
+    stream() {
+      const call = ++calls;
+      return (async function* (): AsyncGenerator<ModelStreamEvent> {
+        if (call === 3) {
+          activeStarted = true;
+          await gate;
+        }
+        yield {
+          type: "text_delta",
+          text: call === 4 ? "## Goal\nQueued compaction" : `answer ${call}`,
+        };
+        yield { type: "completed", stopReason: "stop", usage };
+      })();
+    },
+  };
+  const { socketPath, directory } = await startStack(context, model, undefined, undefined, {
+    keepRecentTokens: 1,
+  });
+  const input = new PassThrough();
+  const { output, text } = captureOutput();
+  const app = await AxlApp.start({
+    client: await connectUnixClient(socketPath),
+    input,
+    output,
+    cwd: directory,
+    color: false,
+  });
+  context.after(() => app.stop());
+
+  input.write("older prompt\r");
+  await until(() => text().includes("answer 1"), "first answer");
+  input.write("recent prompt\r");
+  await until(() => text().includes("answer 2"), "second answer");
+  input.write("active prompt\r");
+  await until(() => activeStarted, "active response");
+  input.write("/compact keep decisions\r");
+  await until(() => text().includes("queued after the active response"), "queued compaction");
+  releaseActive();
+  await until(() => text().includes("Context compacted"), "queued compaction completion");
+});
+
 test("Escape cancels compaction without replacing context", async (context) => {
   let calls = 0;
   let summarizing = false;
@@ -2794,7 +3896,7 @@ test("Escape cancels compaction without replacing context", async (context) => {
   input.write("/compact\r");
   await until(() => summarizing && text().includes("Compacting context"), "summary started");
   input.write("\x1b");
-  await until(() => text().includes("interrupted"), "compaction cancellation");
+  await until(() => text().includes("cancelled"), "compaction cancellation");
   assert.equal(subscription.projector.overview.lastCompaction, undefined);
   assert.doesNotMatch(text(), /Request failed/);
 });
@@ -2993,4 +4095,231 @@ test("request settings are visible, configurable, persisted, and survive resume"
       resumed.text().includes("output    2048") && resumed.text().includes("HTTP idle disabled"),
     "resumed request settings",
   );
+});
+
+test("terminal extension prompts, custom component, autocomplete and markdown run in a daemon-backed session", async (context) => {
+  const { socketPath, directory } = await startStack(context);
+  const input = new PassThrough();
+  const { output, text } = captureOutput();
+  const results: string[] = [];
+  const events: string[] = [];
+  let disposed = 0;
+  let editorDisposed = 0;
+  const extension: TerminalExtension = {
+    manifest: {
+      id: "test.ui",
+      name: "UI fixture",
+      capabilities: [
+        "terminal.commands",
+        "terminal.ui",
+        "terminal.widgets",
+        "terminal.events",
+        "terminal.markdown",
+      ],
+    },
+    activate(api) {
+      assert.equal(api.ui.theme.name, "plain");
+      assert.ok(api.ui.theme.roles().includes("accent"));
+      assert.equal(api.ui.theme.style("accent", "safe\u001b[31m"), "safe");
+      assert.throws(
+        () => api.ui.theme.style("syntaxString", "missing"),
+        /has no syntaxString role/,
+      );
+      assert.throws(
+        () => api.ui.theme.style("constructor" as "accent", "unsafe"),
+        /has no constructor role/,
+      );
+      api.registerHeader("head", { render: () => [{ text: "HEADER SLOT" }] });
+      api.registerFooter("foot", { render: () => [{ text: "FOOTER SLOT" }] });
+      api.registerMarkdownTransformer((markdown) =>
+        markdown.replace("the answer", "transformed answer"),
+      );
+      api.registerAutocompleteProvider({
+        complete: async (prefix) =>
+          prefix.endsWith("#")
+            ? [{ value: "#tag", start: prefix.length - 1, label: "Hashtag" }]
+            : [],
+      });
+      api.registerEditor({
+        render: (_width, state) => ({
+          lines: [{ text: `CUSTOM EDITOR ${state.draft}` }],
+          cursor: { row: 0, column: 14 + state.draft.length },
+        }),
+        handleKey: (key, editor) => {
+          if (key !== "~") return false;
+          editor.setText("custom draft");
+          return true;
+        },
+        dispose: () => {
+          editorDisposed += 1;
+        },
+      });
+      api.on("ui.prompt.start", (event) => {
+        events.push(`start:${event.prompt}`);
+      });
+      api.on("ui.prompt.end", (event) => {
+        events.push(`end:${event.prompt}`);
+      });
+      api.registerCommand({
+        name: "flow",
+        description: "Run UI fixture",
+        run: async (_args, ctx) => {
+          const accepted = await ctx.confirm("Approve", "proceed?");
+          if (!accepted) {
+            results.push("cancelled");
+            return;
+          }
+          const name = await ctx.input("Name", "your name");
+          const draft = await ctx.editor("Draft", "initial");
+          const custom = await api.ui.custom("Custom choice", (done) => ({
+            render: () => [{ text: "Press x to finish" }],
+            handleKey: (key) => {
+              if (key === "x") done("chosen");
+            },
+            dispose: () => {
+              disposed += 1;
+            },
+          }));
+          results.push(`${name}|${draft}|${custom}`);
+          ctx.notify(`Saved ${name}`, "success");
+        },
+      });
+    },
+  };
+  const app = await AxlApp.start({
+    client: await connectUnixClient(socketPath),
+    input,
+    output,
+    cwd: directory,
+    color: false,
+    extensions: [extension],
+  });
+  assert.match(text(), /HEADER SLOT/);
+  assert.match(text(), /FOOTER SLOT/);
+  assert.match(text(), /CUSTOM EDITOR/);
+  const screen = (): string => {
+    const terminal = new VirtualTerminal(100, 24);
+    terminal.write(text());
+    return terminal.rows().join("\n");
+  };
+  input.write("#");
+  await until(() => screen().includes("Hashtag"), "labeled extension completion");
+  input.write("\t");
+  await until(() => screen().includes("CUSTOM EDITOR #tag"), "extension completion accepted");
+  input.write("\x15hello #");
+  await until(() => screen().includes("Hashtag"), "completion after prompt prefix");
+  input.write("\t");
+  await until(() => screen().includes("CUSTOM EDITOR hello #tag"), "partial-prefix replacement");
+  input.write("\x01\x0bhello # tail");
+  await until(() => screen().includes("CUSTOM EDITOR hello # tail"), "draft with suffix");
+  input.write("\x1b[H");
+  await until(
+    () =>
+      (app as unknown as { editor: { textBeforeCursor: string } }).editor.textBeforeCursor === "",
+    "home before middle completion",
+  );
+  input.write("\x1b[C".repeat(7));
+  await until(
+    () =>
+      (app as unknown as { editor: { textBeforeCursor: string } }).editor.textBeforeCursor ===
+      "hello #",
+    "middle cursor placement",
+  );
+  await until(() => screen().includes("Hashtag"), "completion at a middle cursor").catch(
+    (error: unknown) => {
+      throw new Error(`${String(error)}: ${screen()}`);
+    },
+  );
+  input.write("\t!");
+  await until(
+    () => screen().includes("CUSTOM EDITOR hello #tag! tail"),
+    "completion retains the suffix and caret",
+  );
+  input.write("\x01\x0b/flow\r");
+  await until(() => text().includes("Approve · proceed?"), "extension confirm");
+  await screenshotTerminal(text(), "04-confirm");
+  input.write("\r");
+  await until(() => text().includes("Name"), "extension input");
+  input.write("Ada\r");
+  await until(() => text().includes("Draft"), "extension editor");
+  await screenshotTerminal(text(), "05-editor");
+  input.write("\x15line one\x1b\rline two\r");
+  await until(() => text().includes("Custom choice"), "extension custom component");
+  await screenshotTerminal(text(), "06-custom");
+  input.write("x");
+  await until(() => results.length === 1, "extension prompt result");
+  assert.deepEqual(results, ["Ada|line one\nline two|chosen"]);
+  assert.deepEqual(events, [
+    "start:confirm",
+    "end:confirm",
+    "start:input",
+    "end:input",
+    "start:editor",
+    "end:editor",
+    "start:custom",
+    "end:custom",
+  ]);
+  assert.equal(disposed, 1);
+  input.write("~");
+  await until(
+    () => text().includes("CUSTOM EDITOR custom draft"),
+    "custom main editor and key handler",
+  );
+  await screenshotTerminal(text(), "08-custom-composer");
+  input.write("\x15hello\r");
+  await until(() => text().includes("transformed answer"), "transformed canonical reply");
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  const rendered = new VirtualTerminal(100, 24);
+  rendered.write(text());
+  assert.match(
+    rendered.rows().join("\n"),
+    /│ hello/,
+    "expected user transcript after extension editor submitted input",
+  );
+  await screenshotTerminal(text(), "07-transformed-reply");
+  app.stop();
+  await until(() => editorDisposed === 1, "custom editor cleanup");
+});
+
+test("terminal Markdown transformers render an in-flight daemon response before settlement", async (context) => {
+  let release: () => void = () => undefined;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const model: ModelPort = {
+    stream: async function* () {
+      yield { type: "text_delta", text: "the answer" };
+      await held;
+      yield { type: "completed", stopReason: "stop", usage };
+    },
+  };
+  const { socketPath, directory } = await startStack(context, model);
+  const input = new PassThrough();
+  const { output, text } = captureOutput();
+  const app = await AxlApp.start({
+    client: await connectUnixClient(socketPath),
+    input,
+    output,
+    cwd: directory,
+    color: false,
+    extensions: [
+      {
+        manifest: { id: "test.stream", name: "Stream", capabilities: ["terminal.markdown"] },
+        activate(api) {
+          api.registerMarkdownTransformer((value) =>
+            value.replace("the answer", "transformed answer"),
+          );
+        },
+      },
+    ],
+  });
+  try {
+    input.write("show stream\r");
+    await until(() => text().includes("transformed answer"), "transformed streaming output");
+    assert.equal(text().includes("  the answer"), false);
+    await screenshotTerminal(text(), "09-stream-transform");
+  } finally {
+    release();
+    app.stop();
+  }
 });

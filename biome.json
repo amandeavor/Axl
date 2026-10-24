@@ -5,8 +5,14 @@
       "**/*.{ts,json}",
       "!**/{dist,node_modules}",
       "!.release",
+      "!.reference",
       "!packages/ai/src/catalog.generated.ts",
-      "!packages/ai/src/catalog.generated"
+      "!packages/ai/src/catalog.generated",
+      "!packages/extensions/lounge/src/chess-puzzles.generated.ts",
+      "!packages/extensions/lounge/src/honeycomb-data.generated.ts",
+      "!packages/extensions/lounge/src/nonogram-fixtures.generated.ts",
+      "!packages/tui/assets",
+      "!packages/web/src/mascot"
     ]
   },
   "formatter": {
@@ -21,5 +27,22 @@
     "rules": {
       "recommended": true
     }
-  }
+  },
+  "overrides": [
+    {
+      "includes": [
+        "packages/extensions/mcp/**",
+        "packages/sdk/src/mcp.ts",
+        "packages/sdk/test/mcp.test.ts",
+        "packages/protocol/scripts/generate-conformance.ts"
+      ],
+      "linter": {
+        "rules": {
+          "suspicious": {
+            "noTemplateCurlyInString": "off"
+          }
+        }
+      }
+    }
+  ]
 }

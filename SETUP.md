@@ -1,5 +1,6 @@
 <!-- SPDX-FileCopyrightText: 2026 Hari Srinivasan -->
 <!-- SPDX-FileCopyrightText: 2026 Lokesh -->
+<!-- SPDX-FileCopyrightText: 2026 Shaan Narendran -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
 # Set up Axl
@@ -66,7 +67,7 @@ axl daemon stop --interrupt --yes
 
 Use the same `--unsafe`, `--sandbox`, `--image`, or `--socket` selection as the running daemon. Status and stop do not require provider credentials. Restart refuses to switch data directories. Stop and restart refuse active work unless `--interrupt` explicitly authorizes cancellation. `--yes` confirms disconnecting clients. A changed confirmation snapshot requires a fresh command. Exit codes are 0 for success, 1 for errors, 2 for refused or stale confirmation, and 3 for a missing daemon on status or stop. Restart starts a missing daemon.
 
-An incompatible session wire fails loudly and points to these commands. No daemon is automatically replaced on a version mismatch. Host-control version 1 operates independently of session wire version 13 on a separate connection to the same owner-only Unix socket. It does not bypass the session handshake.
+An incompatible session wire fails loudly and points to these commands. No daemon is automatically replaced on a version mismatch. Host-control version 1 operates independently of session wire version 27 on a separate connection to the same owner-only Unix socket. It does not bypass the session handshake.
 
 If graceful cleanup fails or exceeds the host's ten-second wait, inspect `axl daemon status`. Shutdown can still be running. The TUI offers a separate force confirmation when available. From the CLI, explicitly request:
 
@@ -151,11 +152,11 @@ Axl reads global configuration from `~/.axl`:
 - `credentials.json` for credentials managed by `axl login`
 - `settings.json` for model, thinking, web-tool, theme, and terminal preferences
 
-Credentials and settings apply in every workspace. Axl also reads `AGENTS.md`, `.axl/skills`, and `.axl/mcp.json` from the workspace root. A project skill or MCP server replaces the global entry with the same name. Reload the session after changing instructions, skills, or MCP configuration.
+Credentials and settings apply in every workspace. Axl also reads hierarchical `AGENTS.md`, `.axl/skills`, and `.agents/skills` resources. A nearer project Skill replaces a broader or global Skill with the same identity. MCP configuration is global and user-owned. Use `/mcp` in the terminal or web client, ask the model to configure a server, or edit the file directly. Managed changes validate the config, write it privately, and reload the active session.
 
 ## Session profiles
 
-The `standard` profile is the default. It exposes `read`, `write`, `edit`, `bash`, `web_fetch`, and `web_search`, then adds configured Skills and MCP servers.
+The `standard` profile is the default. It exposes `read`, `write`, `edit`, `bash`, `web_fetch`, `web_search`, and daemon-owned capability discovery. Agent Skills and model-callable tools declared by the daemon command registry become visible only after explicit activation and remain active for the rest of the session. Command-backed tools include `compact_context`, `reload_context`, and progressively disclosed `configure_mcp`. Selected MCP tools use their native schemas.
 
 Use the `exec` profile to create a Bash-only session:
 
@@ -190,18 +191,20 @@ Unsafe mode uses a separate daemon socket and session directory under `~/.axl/un
 
 ## Add Agent Skills
 
-Put skills in either location:
+Put Skills in any supported location:
 
 ```text
 ~/.axl/skills/<name>/SKILL.md
-<workspace>/.axl/skills/<name>/SKILL.md
+~/.agents/skills/<name>/SKILL.md
+<repository-or-descendant>/.axl/skills/<name>/SKILL.md
+<repository-or-descendant>/.agents/skills/<name>/SKILL.md
 ```
 
-A project skill overrides a global skill with the same name. Axl validates the [Agent Skills format](https://agentskills.io/specification), adds skill metadata to the startup prompt, and loads full instructions only when the model selects that skill.
+Axl walks from the repository root to the working directory. Later definitions replace earlier definitions with the same `skill:<name>` identity. Discovery validates compact metadata and containment without adding the Skill catalog to the prompt. The model uses `capability_search` to find matching metadata, activate full instructions for the session, and read referenced Skill files through a containment-checked `read` action.
 
 ## Add MCP servers
 
-Put global MCP configuration in `~/.axl/mcp.json` or project configuration in `<workspace>/.axl/mcp.json`. Axl supports MCP `2025-11-25` over stdio and Streamable HTTP, including OAuth. See [`packages/extensions/mcp/README.md`](packages/extensions/mcp/README.md) for the schema and security rules.
+Run `/mcp` in the terminal or web client to see server status and add any MCP server from its README through a guided, probe-before-save flow. You can also ask the model to add, update, list, or remove a server through the daemon-owned `configure_mcp` capability. Both paths validate and atomically update `~/.axl/mcp.json` without granting sandboxed commands access to credentials or session state. Axl does not load project-local MCP configuration. Axl supports MCP `2025-11-25` over stdio and Streamable HTTP, including OAuth. Tools stay outside the model roster until selected through `capability_search`. See [`packages/extensions/mcp/README.md`](packages/extensions/mcp/README.md) for custom server schemas and security rules.
 
 ## Development commands
 

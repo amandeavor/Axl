@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Hari Srinivasan
+// SPDX-FileCopyrightText: 2026 Shaan Narendran
 // SPDX-License-Identifier: Apache-2.0
 
-import { lazy, Suspense, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import {
   type AttachmentPresence,
   type AxlClient,
@@ -14,6 +15,8 @@ import {
   type InteractionAction,
   type JsonObject,
   MAX_UPLOAD_BLOB_BYTES,
+  type McpConfigListResult,
+  type McpServerDefinition,
   type ModelChoice,
   NewSessionController,
   type NewSessionDraft,
@@ -48,14 +51,13 @@ import {
 
 import { BrowserPane, type BrowserPaneState, EMPTY_BROWSER_STATE } from "./browser-pane.tsx";
 import { CommandPalette } from "./command-palette.tsx";
-import {
-  filterCommands,
-  type WebTheme,
-  webPresentationCommands,
-  workspaceReviewScope,
-} from "./commands.ts";
+import { Mascot, type MascotControl } from "./mascot.tsx";
+import { MASCOT_COLOURS } from "./mascot-atlas.ts";
+import { filterCommands, webPresentationCommands, workspaceReviewScope } from "./commands.ts";
 import type { ControlCenterTab } from "./control-center.tsx";
 import { Dock } from "./dock.tsx";
+import { WebExtensionHost, webShortcutKey } from "./extension-host.ts";
+import { extensionManagement } from "./extension-management.ts";
 import { trapDialogFocus } from "./dialog-focus.ts";
 import {
   browserProviderHost,
@@ -68,9 +70,12 @@ import {
   saveWebPreferences,
   SIDEBAR_WIDTH_RANGE,
   validateProjectFolder,
+  WebAuthenticationError,
   type WebBootstrap,
   type WebPreferences,
 } from "./environment.ts";
+import { browserLoungeStorage, type LoungeSettings, saveLoungeSettings } from "./lounge-client.ts";
+import { LoungePane } from "./lounge-pane.tsx";
 import { ModelPicker } from "./model-picker.tsx";
 import { isModelPickerShortcut, nextThinkingLevel } from "./model-picker-state.ts";
 import { NewSessionDialog } from "./new-session-dialog.tsx";
@@ -97,14 +102,26 @@ import {
 import { SessionLifecycle } from "./session-lifecycle.tsx";
 import type { SplitState } from "./split-pane.tsx";
 import { TerminalPane } from "./terminal-pane.tsx";
+import { useActionNotice } from "./use-action-notice.ts";
+import { useWebTheme } from "./use-web-theme.ts";
 import {
+  anyModalOverlayOpen,
+  compactNumber,
   consumePendingPromptDeliveries,
   directShellInput,
+  findSessionInCatalog,
+  isScrolledToBottom,
   matchesSession,
+  messageBlobs,
+  nextSelectableSlashIndex,
+  previewSessionSummary,
   promptDeliveryShortcut,
   restoreDraft,
+  selectableSlashCommand,
+  sessionStateHistory,
   sessionTitle,
   sessionUsageStats,
+  topLightOverlay,
   transcriptMessageMatches,
   transcriptPromptBreakpoints,
   type PendingPromptDelivery,
@@ -117,6 +134,9 @@ import {
 
 const ControlCenter = lazy(() => import("./control-center.tsx").then((module) => ({ default: module.ControlCenter })));
 const Conversation = lazy(() => import("@axl/ui/react").then((module) => ({ default: module.Conversation })));
+// Same chunk as Conversation; resolves without an extra request once the thread
+// has rendered. Used to format streaming output like completed messages.
+const LiveMarkdown = lazy(() => import("@axl/ui/react").then((module) => ({ default: module.Markdown })));
 
 const DEFAULT_LAYOUT: WebPreferences = {
   sidebarWidth: 264,
@@ -124,6 +144,10 @@ const DEFAULT_LAYOUT: WebPreferences = {
   sidebarCollapsed: false,
   changesView: "files",
   panes: DEFAULT_PANES,
+  theme: "system",
+  loungeOpen: true,
+  mascot: true,
+  mascotColour: "Pink",
 };
 const PREVIEW_LAYOUT_KEY = "axl.preview.layout";
 const DAEMON_CONNECTION_LABELS: Readonly<Record<ConnectionState, string>> = {
@@ -139,21 +163,6 @@ const validatePreviewProjectFolder = (path: string): Promise<{
   readonly valid: true;
   readonly path: string;
 }> => Promise.resolve({ valid: true, path });
-const WEB_THEME_KEY = "axl.web.theme";
-
-function storedWebTheme(): WebTheme {
-  try {
-    const value = localStorage.getItem(WEB_THEME_KEY);
-    return value === "light" || value === "dark" ? value : "system";
-  } catch {
-    return "system";
-  }
-}
-
-function compactNumber(value: number): string {
-  return value >= 1000 ? `${(value / 1000).toFixed(value >= 10_000 ? 0 : 1)}k` : String(value);
-}
-
 function previewLayout(): WebPreferences {
   try {
     return parseWebPreferences(JSON.parse(localStorage.getItem(PREVIEW_LAYOUT_KEY) ?? "null"));
@@ -163,43 +172,10 @@ function previewLayout(): WebPreferences {
 }
 
 const EMPTY_STATE: ConversationState = {
-  records: [], compactedEventIds: [], tools: [], interactions: [], operations: [], uncertainShellOperations: [], queue: [], interruptDeliveries: [],
+  records: [], compactedEventIds: [], tools: [], interactions: [], capabilitySearches: [], activeCapabilities: [], capabilityDenials: [], operations: [], uncertainShellOperations: [], queue: [], interruptDeliveries: [], contextResources: [],
   usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, costUsd: 0 },
   closed: false,
 };
-
-function messageBlobs(conversation: ConversationState): readonly BlobReference[] {
-  const blobs = new Map<string, BlobReference>();
-  for (const record of conversation.records) {
-    if (record.kind !== "event" || (record.event.type !== "user.message" && record.event.type !== "assistant.message")) continue;
-    for (const item of record.event.payload.content) {
-      if (item.type === "blob") blobs.set(item.blob.sha256, item.blob);
-    }
-  }
-  return [...blobs.values()];
-}
-
-function sessionStateHistory(conversation: ConversationState): readonly { readonly id: string; readonly label: string; readonly detail: string; readonly timestamp: number }[] {
-  const history: Array<{ readonly id: string; readonly label: string; readonly detail: string; readonly timestamp: number }> = [];
-  for (const record of conversation.records) {
-    if (record.kind !== "event") continue;
-    const event = record.event;
-    switch (event.type) {
-      case "session.created": history.push({ id: event.id, label: "Session created", detail: event.payload.profile ?? "legacy", timestamp: event.timestamp }); break;
-      case "session.resumed": history.push({ id: event.id, label: "Session resumed", detail: "Runtime restored", timestamp: event.timestamp }); break;
-      case "session.closed": history.push({ id: event.id, label: "Session closed", detail: event.payload.reason, timestamp: event.timestamp }); break;
-      case "config.provider": history.push({ id: event.id, label: "Provider", detail: event.payload.providerId, timestamp: event.timestamp }); break;
-      case "config.model": history.push({ id: event.id, label: "Model", detail: event.payload.modelId, timestamp: event.timestamp }); break;
-      case "config.profile": history.push({ id: event.id, label: "Profile", detail: event.payload.profile, timestamp: event.timestamp }); break;
-      case "config.thinking": history.push({ id: event.id, label: "Thinking", detail: event.payload.clamped ? `${event.payload.requested} → ${event.payload.effective}` : event.payload.effective, timestamp: event.timestamp }); break;
-      case "config.dialect": history.push({ id: event.id, label: "Tool dialect", detail: `${event.payload.dialectId} · ${event.payload.reason.replaceAll("_", " ")}`, timestamp: event.timestamp }); break;
-      case "config.tools": history.push({ id: event.id, label: "Web tools", detail: `search ${event.payload.webSearch ? "on" : "off"} · fetch ${event.payload.webFetch ? "on" : "off"}`, timestamp: event.timestamp }); break;
-      case "sandbox.configured": history.push({ id: event.id, label: "Sandbox", detail: event.payload.enforced ? `${event.payload.provider} enforced` : "not enforced", timestamp: event.timestamp }); break;
-      default: break;
-    }
-  }
-  return history.slice(-20).reverse();
-}
 
 interface ComposerAttachment {
   readonly id: number;
@@ -274,11 +250,54 @@ export interface WebPreview {
   readonly workspaceClient?: WorkspaceOperations;
 }
 
+function WebWidgetView({ host, widgetKey, onError }: { readonly host: WebExtensionHost; readonly widgetKey: string; readonly onError: (message: string) => void }): React.JSX.Element {
+  const root = useRef<HTMLDivElement>(null);
+  const report = useRef(onError);
+  report.current = onError;
+  useEffect(() => {
+    if (root.current === null) return;
+    let cleanup: () => Promise<void>;
+    try { cleanup = host.mountWidget(widgetKey, root.current); }
+    catch (cause) { report.current(cause instanceof Error ? cause.message : String(cause)); return; }
+    return () => { void cleanup().catch((cause: unknown) => report.current(cause instanceof Error ? cause.message : String(cause))); };
+  }, [host, widgetKey]);
+  return <aside className="extension-widget" ref={root} />;
+}
+
 export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): React.JSX.Element {
   const initialLayout = useRef(preview === undefined ? DEFAULT_LAYOUT : previewLayout()).current;
   const [client, setClient] = useState<AxlClient>();
   const [bootstrap, setBootstrap] = useState<WebBootstrap>();
+  const [loungeOpen, setLoungeOpen] = useState(initialLayout.loungeOpen);
+  // On by default; /mascot changes it and the host remembers the choice.
+  const [mascotOn, setMascotOn] = useState(initialLayout.mascot);
+  const [mascotColour, setMascotColour] = useState(initialLayout.mascotColour);
+  const mascotControl = useRef<MascotControl | null>(null);
+  const failMascot = useCallback((message: string) => {
+    setMascotOn(false);
+    setError(`Mascot: ${message}`);
+  }, []);
+  const [authRequired, setAuthRequired] = useState(false);
+  const [loungeSettings, setLoungeSettings] = useState<LoungeSettings>();
+  // Every responsive decision follows the app frame, not the window, so the app keeps its
+  // layout when Lounge takes half of the page.
+  const frameRef = useRef<HTMLDivElement>(null);
+  const [frameSize, setFrameSize] = useState({ width: innerWidth, height: innerHeight });
+  useLayoutEffect(() => {
+    const frame = frameRef.current;
+    if (frame === null) return;
+    const measure = (): void => setFrameSize({ width: frame.clientWidth, height: frame.clientHeight });
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(frame);
+    return () => observer.disconnect();
+  }, []);
+  const compactDock = frameSize.width <= 1180;
+  const narrowFrame = frameSize.width <= 760;
   const [sessions, setSessions] = useState<readonly SessionSummary[]>(preview?.sessions ?? []);
+  const [sessionsCursor, setSessionsCursor] = useState<string>();
+  const [loadingMoreSessions, setLoadingMoreSessions] = useState(false);
+  const sessionCatalogGeneration = useRef(0);
   const [opened, setOpened] = useState<SessionOpenResult | undefined>(preview?.opened);
   const [conversation, setConversation] = useState<ConversationState>(preview?.conversation ?? EMPTY_STATE);
   const [draft, setDraft] = useState("");
@@ -291,7 +310,12 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
   const pendingInputSequence = useRef(0);
   const [pendingInputs, setPendingInputs] = useState<readonly PendingPromptDelivery[]>([]);
   const [query, setQuery] = useState("");
-  const [busy, setBusy] = useState(false);
+  // Scoped in-flight flags. Session configuration (model/thinking) and
+  // background lifecycle work must never disable the composer, so "busy" is
+  // split by concern instead of one global mutex.
+  const [sessionSwitching, setSessionSwitching] = useState(false);
+  const [lifecycleBusy, setLifecycleBusy] = useState(false);
+  const [directBusy, setDirectBusy] = useState(false);
   const [directOperation, setDirectOperation] = useState<DirectOperation>();
   const directCancellationRequested = useRef(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -299,7 +323,7 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
   const [sidebarWidth, setSidebarWidth] = useState(initialLayout.sidebarWidth);
   const [dockWidth, setDockWidth] = useState(initialLayout.dockWidth);
   const [changesView, setChangesView] = useState<"files" | "all">(initialLayout.changesView);
-  const [theme, setTheme] = useState<WebTheme>(storedWebTheme);
+  const { theme, setTheme } = useWebTheme(initialLayout.theme);
   const [paneLayout, setPaneLayout] = useState<PaneLayout>(() => createPaneLayout(initialLayout.panes));
   const [browserPane, setBrowserPane] = useState<BrowserPaneState>(EMPTY_BROWSER_STATE);
   const [mobileDock, setMobileDock] = useState(false);
@@ -330,6 +354,9 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
   const [newSessionError, setNewSessionError] = useState<string>();
   const [presence, setPresence] = useState<readonly AttachmentPresence[]>([]);
   const [providerActionError, setProviderActionError] = useState<string>();
+  const [mcpConfiguration, setMcpConfiguration] = useState<McpConfigListResult>();
+  const [mcpError, setMcpError] = useState<string>();
+  const [mcpBusy, setMcpBusy] = useState(false);
   const [settingsError, setSettingsError] = useState<string>();
   const [providerLogin, setProviderLogin] = useState<{
     readonly providerId: string;
@@ -338,7 +365,9 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
   const [transcriptQuery, setTranscriptQuery] = useState("");
   const [transcriptMatch, setTranscriptMatch] = useState(-1);
   const [transcriptNavigationVisible, setTranscriptNavigationVisible] = useState(false);
+  const [showJumpToLatest, setShowJumpToLatest] = useState(false);
   const [activePromptId, setActivePromptId] = useState<string>();
+  const [forkPicking, setForkPicking] = useState(false);
   const [providerDirectory, setProviderDirectory] = useState<ProviderDirectoryState>({
     status: preview === undefined ? "idle" : "ready",
     models: preview?.modelCatalog ?? [],
@@ -368,8 +397,14 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
   const [workspaceCheckpointEnabled, setWorkspaceCheckpointEnabled] = useState<boolean>();
   const [connection, setConnection] = useState<ConnectionState>(preview ? "connected" : "connecting");
   const [error, setError] = useState<string>();
-  const [actionNotice, setActionNotice] = useState<string>();
+  const { actionNotice, showActionNotice } = useActionNotice();
   const [commands, setCommands] = useState<readonly EffectiveCommand[]>(preview?.commands ?? []);
+  const [webExtensions, setWebExtensions] = useState<WebExtensionHost>();
+  const [extensionRevision, setExtensionRevision] = useState(0);
+  const webExtensionRef = useRef<WebExtensionHost>(undefined);
+  const webExtensionSession = useRef<SessionId>(undefined);
+  const workingExtension = useRef<{ host: WebExtensionHost | undefined; operation: string | undefined }>({ host: undefined, operation: undefined });
+  const [extensionEpoch, setExtensionEpoch] = useState(0);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const [commandPaletteError, setCommandPaletteError] = useState<string>();
   const [slashCommandIndex, setSlashCommandIndex] = useState(0);
@@ -382,6 +417,10 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
   const subscription = useRef<SessionSubscription | undefined>(undefined);
   const blobUrlCache = useRef(new Map<string, string>());
   const blobUrlSession = useRef<string | undefined>(undefined);
+  // One long-lived controller per opened session; aborted only when the session
+  // changes or the component unmounts, never on an unrelated transcript update.
+  const blobReadController = useRef<AbortController | undefined>(undefined);
+  const blobReadsInFlight = useRef(new Set<string>());
   const openedSessionId = useRef<SessionId | undefined>(preview?.opened.sessionId);
   const selectionGeneration = useRef(0);
   const workspaceRequestGeneration = useRef(0);
@@ -389,8 +428,12 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
   const fileRequest = useRef(0);
   const reviewRequest = useRef(0);
   const transcript = useRef<HTMLDivElement>(null);
+  const composerForm = useRef<HTMLFormElement>(null);
+  const scrollRaf = useRef<number | undefined>(undefined);
+  // Auto-scroll only follows streaming output when the reader is already at the
+  // bottom, so scrolling up during a response is never hijacked.
+  const stickToBottom = useRef(true);
   const transcriptNavigationTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-  const actionNoticeTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const mobileMenu = useRef<HTMLButtonElement>(null);
   const sidebarPanel = useRef<HTMLElement>(null);
   const sidebarClose = useRef<HTMLButtonElement>(null);
@@ -404,37 +447,95 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
   const sidebarWasOpen = useRef(false);
 
   useEffect(() => {
-    const media = matchMedia("(prefers-color-scheme: dark)");
-    const apply = (): void => {
-      document.documentElement.dataset.theme = theme === "system" ? (media.matches ? "dark" : "light") : theme;
+    // Keep the transcript's bottom padding equal to the live composer height so a
+    // tall composer (attachments, pending inputs, slash popup, long draft) never
+    // covers the last message.
+    const form = composerForm.current;
+    const view = transcript.current;
+    if (form === null || view === null) return;
+    const observer = new ResizeObserver(() => {
+      view.style.setProperty("--composer-height", `${form.offsetHeight}px`);
+    });
+    observer.observe(form);
+    return () => {
+      observer.disconnect();
+      view.style.removeProperty("--composer-height");
     };
-    apply();
-    try {
-      localStorage.setItem(WEB_THEME_KEY, theme);
-    } catch (cause) {
-      setSettingsError(cause instanceof Error ? cause.message : "Could not save the theme preference");
-    }
-    if (theme !== "system") return;
-    media.addEventListener("change", apply);
-    return () => media.removeEventListener("change", apply);
-  }, [theme]);
+  }, [opened]);
+
+  useEffect(
+    () => () => {
+      if (scrollRaf.current !== undefined) cancelAnimationFrame(scrollRaf.current);
+    },
+    [],
+  );
+
+
+  const listSessionsPage = (
+    current: AxlClient,
+    pageCursor?: string,
+  ): Promise<{ readonly sessions: readonly SessionSummary[]; readonly nextPageCursor?: string }> =>
+    current.request("session.list", {
+      scope: "all_local",
+      order: "recent",
+      pageSize: 100,
+      ...(pageCursor === undefined ? {} : { pageCursor }),
+    });
 
   const refreshSessions = async (current: AxlClient): Promise<readonly SessionSummary[]> => {
-    const result = await current.request("session.list", { scope: "all_local", order: "recent", pageSize: 100 });
+    sessionCatalogGeneration.current += 1;
+    const result = await listSessionsPage(current);
     setSessions(result.sessions);
+    setSessionsCursor(result.nextPageCursor);
     return result.sessions;
+  };
+
+  const loadMoreSessions = async (): Promise<void> => {
+    if (client === undefined || sessionsCursor === undefined || loadingMoreSessions) return;
+    const generation = sessionCatalogGeneration.current;
+    const cursor = sessionsCursor;
+    setLoadingMoreSessions(true);
+    try {
+      const result = await listSessionsPage(client, cursor);
+      if (generation !== sessionCatalogGeneration.current) return;
+      setSessions((existing) => {
+        const seen = new Set(existing.map((session) => session.sessionId));
+        return [...existing, ...result.sessions.filter((session) => !seen.has(session.sessionId))];
+      });
+      setSessionsCursor(result.nextPageCursor);
+    } catch (cause) {
+      if (generation === sessionCatalogGeneration.current)
+        setError(cause instanceof Error ? cause.message : "Could not load more sessions");
+    } finally {
+      if (generation === sessionCatalogGeneration.current) setLoadingMoreSessions(false);
+    }
   };
 
   const refreshSessionCatalog = async (current: AxlClient): Promise<void> => {
     const next = await refreshSessions(current);
     const selectedId = openedSessionId.current;
     if (selectedId === undefined) return;
-    const selected = next.find((session) => session.sessionId === selectedId);
-    if (selected !== undefined) {
+    let summary = next.find((session) => session.sessionId === selectedId);
+    if (summary === undefined) {
+      // Absent from the first page does not mean the session was deleted: with
+      // more than one page it may simply sort past the first page. Confirm it is
+      // missing across the whole catalog before tearing it down.
+      const lookup = await findSessionInCatalog(
+        (cursor) => listSessionsPage(current, cursor),
+        selectedId,
+      );
+      if (openedSessionId.current !== selectedId) return;
+      if (!lookup.confirmedAbsent) {
+        if (lookup.session === undefined) return;
+        summary = lookup.session;
+      }
+    }
+    if (summary !== undefined) {
+      const found = summary;
       setOpened((value) => value === undefined ? value : {
         ...value,
-        ...(selected.title === undefined ? {} : { title: selected.title }),
-        runtime: selected.runtime,
+        ...(found.title === undefined ? {} : { title: found.title }),
+        runtime: found.runtime,
       });
       return;
     }
@@ -472,7 +573,8 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
     setModelActionError(undefined);
     setSessionLifecycleError(undefined);
     setCommandPaletteError(undefined);
-    setBusy(true); setDirectOperation(undefined); setError(undefined); setTerminalError(undefined); setSidebarOpen(false); setMobileDock(false); setTranscriptSearchOpen(false); setUsageOpen(false); setControlCenter(undefined); setSessionLifecycleOpen(false); setRequeueOpen(false); setRequeueBusyItemId(undefined); setRequeueError(undefined); setNewSessionOpen(false); setTranscriptQuery(""); setActivePromptId(undefined); setWorkspaceReview(undefined); setWorkspaceBrowser({ path: "", entries: [], loaded: false }); setWorkspaceScope("working"); setWorkspaceCheckpointEnabled(undefined); setBrowserError(undefined); setReviewError(undefined); setBrowserLoading(false); setReviewLoading(false); setOpened(undefined); setConversation(EMPTY_STATE);
+    setSessionSwitching(true); setDirectOperation(undefined); setError(undefined); setTerminalError(undefined); setSidebarOpen(false); setMobileDock(false); setTranscriptSearchOpen(false); setUsageOpen(false); setControlCenter(undefined); setSessionLifecycleOpen(false); setRequeueOpen(false); setRequeueBusyItemId(undefined); setRequeueError(undefined); setNewSessionOpen(false); setTranscriptQuery(""); setActivePromptId(undefined); setForkPicking(false); setWorkspaceReview(undefined); setWorkspaceBrowser({ path: "", entries: [], loaded: false }); setWorkspaceScope("working"); setWorkspaceCheckpointEnabled(undefined); setBrowserError(undefined); setReviewError(undefined); setBrowserLoading(false); setReviewLoading(false); setOpened(undefined); setConversation(EMPTY_STATE);
+    stickToBottom.current = true; setShowJumpToLatest(false);
     const previous = subscription.current;
     subscription.current = undefined;
     try {
@@ -484,8 +586,24 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
       let live = false;
       const nextSubscription = await subscribeSession(current, next.sessionId, {
         onEvent: (event) => {
+          if (live) mascotControl.current?.director.handleEvent(event, Date.now());
+          if (live && webExtensionSession.current === sessionId) {
+            void webExtensionRef.current?.dispatch("session.event", event).catch((cause: unknown) =>
+              setError(cause instanceof Error ? cause.message : String(cause)),
+            );
+          }
           if (live && event.type === "config.dialect" && event.payload.reason === "reload") {
-            void providerDirectoryController.current?.load(true).catch(() => undefined);
+            setExtensionEpoch((epoch) => epoch + 1);
+            void providerDirectoryController.current
+              ?.load(true)
+              .catch((cause: unknown) =>
+                setError(
+                  cause instanceof Error ? cause.message : "Could not refresh the provider catalog",
+                ),
+              );
+            if (current.connection.grantedCapabilities.includes("mcp.config.list")) {
+              void current.listMcpServers().then(setMcpConfiguration).catch(() => undefined);
+            }
           }
         },
         onChange: (projector) => {
@@ -514,7 +632,7 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
         setError(cause instanceof Error ? cause.message : "Could not open the session");
       }
     } finally {
-      if (generation === selectionGeneration.current) setBusy(false);
+      if (generation === selectionGeneration.current) setSessionSwitching(false);
     }
   };
 
@@ -529,6 +647,12 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
     void connectWebEnvironment().then(async (environment) => {
       if (disposed) { environment.client.close(); return; }
       activeClient = environment.client; setClient(environment.client); setBootstrap(environment.bootstrap);
+      setLoungeOpen(environment.bootstrap.preferences.loungeOpen);
+      setMascotOn(environment.bootstrap.preferences.mascot);
+      setMascotColour(environment.bootstrap.preferences.mascotColour);
+      setLoungeSettings(environment.bootstrap.lounge?.settings);
+      if (environment.bootstrap.lounge?.error !== undefined)
+        setError(`Lounge settings could not be read, so defaults are in use: ${environment.bootstrap.lounge.error}`);
       const providers = new ProviderDirectoryController(environment.client);
       const configuration = new SessionConfigurationController(environment.client);
       providerDirectoryController.current = providers;
@@ -537,7 +661,8 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
       configuration.subscribe(setConfigurationState);
       if (environment.client.connection.grantedCapabilities.includes("command.list")) {
         commandController.current = new CommandController(environment.client, () =>
-          webPresentationCommands({
+          [
+          ...webPresentationCommands({
             canLogin: environment.bootstrap.hostCapabilities.includes("provider.auth.login"),
             openNewSession: (mode) => {
               const draft =
@@ -559,16 +684,30 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
               setControlCenter("settings");
             },
             setTheme,
+            ...(environment.bootstrap.lounge === undefined ? {} : { toggleLounge: (open?: boolean) => toggleLoungeRef.current(open) }),
+            toggleMascot: (argument?: string) => toggleMascotRef.current(argument),
           }),
+          ...(webExtensionRef.current?.commands().map((command) => ({
+            id: `${command.extensionId}.${command.name}`,
+            name: command.name,
+            description: command.description,
+            extensionId: command.extensionId,
+            run: (argument?: string) => command.run(argument ?? ""),
+          })) ?? []),
+          ],
         );
       }
       setSidebarWidth(environment.bootstrap.preferences.sidebarWidth);
       setDockWidth(environment.bootstrap.preferences.dockWidth);
       setChangesView(environment.bootstrap.preferences.changesView);
       setSidebarCollapsed(environment.bootstrap.preferences.sidebarCollapsed);
+      setTheme(environment.bootstrap.preferences.theme);
       setPaneLayout(createPaneLayout(environment.bootstrap.preferences.panes));
       if (environment.client.connection.grantedCapabilities.includes("provider.list")) {
-        void providers.load().catch(() => undefined);
+        void providers.load().catch((cause: unknown) => {
+          if (!disposed)
+            setError(cause instanceof Error ? cause.message : "Could not load the provider catalog");
+        });
       }
       removeStateListener = environment.client.onStateChange((state) => {
         if (!disposed) {
@@ -598,6 +737,7 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
         setNewSessionOpen(true);
       }
     }).catch((cause: unknown) => {
+      if (cause instanceof WebAuthenticationError) setAuthRequired(true);
       if (!disposed) {
         setConnection("disconnected");
         setError(cause instanceof Error ? cause.message : "Could not start Axl web");
@@ -622,9 +762,92 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
     };
   }, [preview]);
 
+  const messageBlobList = useMemo(() => messageBlobs(conversation), [conversation.records]);
+  // Stable identity for the set of attachments; changes only when a blob is
+  // added or removed, not on every streamed token.
+  const messageBlobKey = useMemo(
+    () => messageBlobList.map((reference) => reference.sha256).sort().join(","),
+    [messageBlobList],
+  );
+  useEffect(() => {
+    if (preview !== undefined) return;
+    if (client === undefined || opened === undefined) {
+      if (webExtensionRef.current !== undefined) {
+        void webExtensionRef.current.dispose().catch((cause: unknown) =>
+          setError(cause instanceof Error ? cause.message : "Web extension cleanup failed"),
+        );
+        webExtensionRef.current = undefined;
+        webExtensionSession.current = undefined;
+        setWebExtensions(undefined);
+      }
+      return;
+    }
+    const sessionId = opened.sessionId;
+    if (webExtensionSession.current !== undefined && webExtensionSession.current !== sessionId) {
+      void webExtensionRef.current?.dispose().catch((cause: unknown) =>
+        setError(cause instanceof Error ? cause.message : "Web extension cleanup failed"),
+      );
+      webExtensionRef.current = undefined;
+      webExtensionSession.current = undefined;
+      setWebExtensions(undefined);
+    }
+    let cancelled = false;
+    void (async () => {
+      const inventory = await client.listExtensions({ sessionId });
+      const next = await WebExtensionHost.load(
+        inventory, sessionId, document.baseURI, showActionNotice, undefined, setTheme,
+        client.connection.grantedCapabilities.includes("extension.list") ? [extensionManagement(client, sessionId)] : [],
+      );
+      if (cancelled) { await next.dispose(); return; }
+      const previous = webExtensionRef.current;
+      webExtensionRef.current = next;
+      webExtensionSession.current = sessionId;
+      try {
+        setCommands(await commandController.current?.refresh(sessionId) ?? []);
+      } catch (cause) {
+        webExtensionRef.current = previous;
+        if (previous === undefined) webExtensionSession.current = undefined;
+        await next.dispose();
+        throw cause;
+      }
+      setWebExtensions(next);
+      const unsubscribe = next.subscribe(() => {
+        if (webExtensionRef.current !== next) return;
+        setExtensionRevision((revision) => revision + 1);
+        void refreshCommandDirectory(sessionId).catch((cause: unknown) =>
+          setError(cause instanceof Error ? cause.message : String(cause)),
+        );
+      });
+      await previous?.dispose();
+      if (cancelled) unsubscribe();
+    })().catch((cause: unknown) => {
+      if (!cancelled) setError(cause instanceof Error ? cause.message : "Could not load web extensions");
+    });
+    return () => { cancelled = true; };
+  }, [client, opened?.sessionId, extensionEpoch, preview]);
+  useEffect(() => {
+    const previous = workingExtension.current;
+    const operation = conversation.activeOperationId;
+    if (previous.host === webExtensions && previous.operation === operation) return;
+    workingExtension.current = { host: webExtensions, operation };
+    if (previous.host === webExtensions && previous.operation !== undefined)
+      void webExtensions?.dispatch("working.end").catch((cause: unknown) => setError(cause instanceof Error ? cause.message : String(cause)));
+    if (operation !== undefined)
+      void webExtensions?.dispatch("working.start").catch((cause: unknown) => setError(cause instanceof Error ? cause.message : String(cause)));
+  }, [conversation.activeOperationId, webExtensions]);
+  useEffect(() => () => {
+    void webExtensionRef.current?.dispose().catch((cause: unknown) =>
+      console.error("Web extension cleanup failed", cause),
+    );
+  }, []);
+
   useEffect(() => {
     const sessionId = opened?.sessionId;
     if (blobUrlSession.current !== sessionId) {
+      // Session changed: revoke cached URLs and abort the previous session's reads.
+      blobReadController.current?.abort();
+      blobReadController.current = undefined;
+      blobReadsInFlight.current.clear();
       for (const url of blobUrlCache.current.values()) URL.revokeObjectURL(url);
       blobUrlCache.current.clear();
       blobUrlSession.current = sessionId;
@@ -632,13 +855,14 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
     }
     if (preview !== undefined || client === undefined || sessionId === undefined || !client.connection.grantedCapabilities.includes("session.blob.read")) return;
     const activeSessionId = sessionId;
-    let cancelled = false;
-    const controller = new AbortController();
-    for (const reference of messageBlobs(conversation)) {
-      if (blobUrlCache.current.has(reference.sha256)) continue;
+    if (blobReadController.current === undefined) blobReadController.current = new AbortController();
+    const controller = blobReadController.current;
+    for (const reference of messageBlobList) {
+      if (blobUrlCache.current.has(reference.sha256) || blobReadsInFlight.current.has(reference.sha256)) continue;
+      blobReadsInFlight.current.add(reference.sha256);
       void client.readBlob(activeSessionId, reference, { signal: controller.signal }).then((bytes) => {
         const url = URL.createObjectURL(new Blob([new Uint8Array(bytes)], { type: reference.mediaType }));
-        if (cancelled || blobUrlSession.current !== activeSessionId) {
+        if (controller.signal.aborted || blobUrlSession.current !== activeSessionId) {
           URL.revokeObjectURL(url);
           return;
         }
@@ -646,13 +870,17 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
         setBlobUrls(new Map(blobUrlCache.current));
       }).catch((cause: unknown) => {
         if (!controller.signal.aborted) setError(cause instanceof Error ? cause.message : "Could not load an attachment");
+      }).finally(() => {
+        blobReadsInFlight.current.delete(reference.sha256);
       });
     }
-    return () => {
-      cancelled = true;
-      controller.abort();
-    };
-  }, [client, conversation.records, opened?.sessionId, preview]);
+    // No cleanup abort: in-flight reads outlive unrelated transcript updates and
+    // are cancelled only on session change (above) or unmount (below).
+  }, [client, messageBlobKey, opened?.sessionId, preview]);
+  useEffect(() => () => {
+    blobReadController.current?.abort();
+    blobReadController.current = undefined;
+  }, []);
 
   useEffect(() => () => {
     for (const url of blobUrlCache.current.values()) URL.revokeObjectURL(url);
@@ -662,7 +890,16 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
     providerLoginController.current?.abort();
   }, []);
 
-  useEffect(() => { transcript.current?.scrollTo({ top: transcript.current.scrollHeight }); }, [conversation.records.length, conversation.activity?.sequence]);
+  useEffect(() => {
+    const viewport = transcript.current;
+    if (viewport === null) return;
+    if (stickToBottom.current) {
+      viewport.scrollTo({ top: viewport.scrollHeight });
+      setShowJumpToLatest(false);
+    } else {
+      setShowJumpToLatest(true);
+    }
+  }, [conversation.records.length, conversation.activity?.sequence]);
   useEffect(() => {
     setPendingInputs((current) => consumePendingPromptDeliveries(current, conversation));
   }, [conversation.records]);
@@ -677,20 +914,31 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
   const wantsChanges = paneLayout.panes.includes("changes");
   useEffect(() => {
     if (opened === undefined) return;
-    if (wantsFiles && !workspaceBrowser.loaded && !browserLoading && browserError === undefined) void loadWorkspaceDirectory("");
-    if (wantsChanges && workspaceReview === undefined && !reviewLoading && reviewError === undefined) void loadWorkspaceChanges(workspaceScope);
-    // Only pane visibility and session identity trigger loads; loader state is read, not tracked.
-  }, [opened?.sessionId, wantsFiles, wantsChanges]);
+    // Never issue workspace RPCs the connection was not granted; the pane picker
+    // already renders the "not granted" state. Capability predicates are
+    // declared later in the component, so recompute them here from primitives.
+    const granted = (capability: string): boolean =>
+      preview?.capabilities === undefined
+        ? preview !== undefined || client?.connection.grantedCapabilities.includes(capability) === true
+        : preview.capabilities.includes(capability);
+    const isCode = opened.profile !== "chat";
+    const canBrowse = isCode && granted("session.workspace.list") && granted("session.workspace.read") && (preview?.workspaceClient !== undefined || client !== undefined);
+    const canReview = isCode && granted("session.workspace.status") && granted("session.workspace.diff") && (preview?.workspace !== undefined || preview?.workspaceClient !== undefined || client !== undefined);
+    if (wantsFiles && canBrowse && !workspaceBrowser.loaded && !browserLoading && browserError === undefined) void loadWorkspaceDirectory("");
+    if (wantsChanges && canReview && workspaceReview === undefined && !reviewLoading && reviewError === undefined) void loadWorkspaceChanges(workspaceScope);
+    // Only pane visibility, session identity, and connection identity trigger
+    // loads; loader state is read, not tracked.
+  }, [opened?.sessionId, opened?.profile, wantsFiles, wantsChanges, client, preview]);
   useEffect(() => setTranscriptMatch(-1), [transcriptQuery]);
   useEffect(() => setSlashCommandIndex(0), [draft]);
   useEffect(() => {
-    if (!matchMedia("(max-width: 760px)").matches) return;
+    if (!narrowFrame) return;
     if (sidebarOpen) sidebarClose.current?.focus();
     else if (sidebarWasOpen.current) mobileMenu.current?.focus();
     sidebarWasOpen.current = sidebarOpen;
   }, [sidebarOpen]);
   useEffect(() => {
-    if (!matchMedia("(max-width: 1180px)").matches) {
+    if (!compactDock) {
       mobileDockWasOpen.current = false;
       return;
     }
@@ -702,20 +950,32 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
     mobileDockWasOpen.current = mobileDock;
   }, [mobileDock]);
   useEffect(() => {
-    const media = matchMedia("(max-width: 1180px)");
-    const closeDesktopOverlay = (): void => {
-      if (!media.matches) setMobileDock(false);
-    };
-    closeDesktopOverlay();
-    media.addEventListener("change", closeDesktopOverlay);
-    return () => media.removeEventListener("change", closeDesktopOverlay);
-  }, []);
+    if (!compactDock) setMobileDock(false);
+  }, [compactDock]);
   useEffect(() => {
     const keydown = (event: KeyboardEvent): void => {
+      // A modal dialog that handled the key (for example its own Escape) marks
+      // the event handled; never act on top of it.
+      if (event.defaultPrevented) return;
+      const overlays = {
+        requeue: requeueOpen,
+        sessionLifecycle: sessionLifecycleOpen,
+        newSession: newSessionOpen,
+        commandPalette: commandPaletteOpen,
+        transcriptSearch: transcriptSearchOpen,
+        usage: usageOpen,
+        controlCenter: controlCenter !== undefined,
+        mobileDock,
+        sidebar: sidebarOpen,
+      };
+      const modalOpen = anyModalOverlayOpen(overlays);
       if ((sidebarOpen || mobileDock) && event.key !== "Escape") return;
       if (isModelPickerShortcut(event) && newSessionOpen) {
         event.preventDefault();
         setNewSessionModelPickerOpenRequest((current) => current + 1);
+      } else if (modalOpen) {
+        // Modal dialogs own the keyboard; they handle Escape themselves.
+        return;
       } else if (
         isModelPickerShortcut(event) &&
         !commandPaletteOpen &&
@@ -740,7 +1000,8 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
         opened !== undefined &&
         (preview !== undefined ||
           client?.connection.grantedCapabilities.includes("session.configure") === true) &&
-        !busy &&
+        !sessionSwitching &&
+        !directBusy &&
         configurationState.pending.length === 0 &&
         conversation.activeOperationId === undefined &&
         (preview !== undefined || connection === "connected")
@@ -762,7 +1023,15 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
         void refreshCommandDirectory(opened?.sessionId).catch((cause: unknown) =>
           setCommandPaletteError(cause instanceof Error ? cause.message : "Could not refresh commands"),
         );
-      } else if ((event.metaKey || event.ctrlKey) && event.key.toLocaleLowerCase() === "f" && opened !== undefined) {
+      } else if (
+        (event.metaKey || event.ctrlKey) &&
+        event.key.toLocaleLowerCase() === "f" &&
+        opened !== undefined &&
+        event.target instanceof Element &&
+        (event.target.closest(".composer") !== null || event.target.closest(".thread") !== null)
+      ) {
+        // Only capture find inside the conversation; leave native browser find
+        // available when focus is in the Preview, Files, Changes, or Terminal panes.
         event.preventDefault();
         setControlCenter(undefined);
         setUsageOpen(false);
@@ -770,17 +1039,38 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
       } else if (event.altKey && event.key === "ArrowUp" && opened !== undefined) {
         event.preventDefault();
         void restoreQueuedInputs(false);
+      } else if (!event.repeat && webExtensionRef.current !== undefined && opened !== undefined &&
+        !document.querySelector("dialog[open]") &&
+        !(event.target instanceof Element && event.target.closest("input,textarea,select,[contenteditable]") !== null) &&
+        !commandPaletteOpen && controlCenter === undefined) {
+        const key = webShortcutKey(event);
+        const run = key === undefined ? undefined : webExtensionRef.current.shortcut(key);
+        if (run !== undefined) {
+          event.preventDefault();
+          void Promise.resolve().then(run).catch((cause: unknown) => setError(cause instanceof Error ? cause.message : String(cause)));
+        }
       } else if (event.key === "Escape") {
-        if (commandPaletteOpen || transcriptSearchOpen || usageOpen || controlCenter !== undefined || sidebarOpen || mobileDock || requeueOpen || newSessionOpen) {
-          setCommandPaletteOpen(false);
-          setTranscriptSearchOpen(false);
-          setUsageOpen(false);
-          setControlCenter(undefined);
-          setSidebarOpen(false);
-          setMobileDock(false);
-          setRequeueOpen(false);
-          if (!busy) setNewSessionOpen(false);
-        } else if (opened !== undefined && (conversation.activeOperationId !== undefined || pendingInputs.length > 0 || conversation.queue.some((item) => item.status === "queued" || item.status === "paused"))) {
+        if (forkPicking) {
+          event.preventDefault();
+          setForkPicking(false);
+          return;
+        }
+        const top = topLightOverlay(overlays);
+        if (top !== undefined) {
+          // Close only the topmost light overlay, one Escape at a time.
+          if (top === "commandPalette") setCommandPaletteOpen(false);
+          else if (top === "transcriptSearch") setTranscriptSearchOpen(false);
+          else if (top === "usage") setUsageOpen(false);
+          else if (top === "controlCenter") setControlCenter(undefined);
+          else if (top === "mobileDock") setMobileDock(false);
+          else if (top === "sidebar") setSidebarOpen(false);
+        } else if (
+          opened !== undefined &&
+          (event.target instanceof HTMLElement &&
+            (event.target.closest(".composer") !== null ||
+              event.target.closest(".thread") !== null)) &&
+          (conversation.activeOperationId !== undefined || pendingInputs.length > 0 || conversation.queue.some((item) => item.status === "queued" || item.status === "paused"))
+        ) {
           void restoreQueuedInputs(true);
         }
       }
@@ -789,9 +1079,8 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
     return () => {
       removeEventListener("keydown", keydown);
       if (transcriptNavigationTimer.current !== undefined) clearTimeout(transcriptNavigationTimer.current);
-      if (actionNoticeTimer.current !== undefined) clearTimeout(actionNoticeTimer.current);
     };
-  }, [opened, commandPaletteOpen, transcriptSearchOpen, usageOpen, controlCenter, sidebarOpen, mobileDock, requeueOpen, newSessionOpen, busy, conversation.activeOperationId, conversation.queue, conversation.provider, conversation.model, conversation.thinking, configurationState.pending.length, connection, client, modelCatalog, pendingInputs.length, preview]);
+  }, [opened, commandPaletteOpen, transcriptSearchOpen, usageOpen, controlCenter, sidebarOpen, mobileDock, requeueOpen, newSessionOpen, sessionLifecycleOpen, sessionSwitching, directBusy, lifecycleBusy, forkPicking, conversation.activeOperationId, conversation.queue, conversation.provider, conversation.model, conversation.thinking, configurationState.pending.length, connection, client, modelCatalog, pendingInputs.length, preview]);
 
   useEffect(() => {
     if (!usageOpen) return;
@@ -838,7 +1127,7 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
 
   const createSession = async (): Promise<void> => {
     if (!client || !bootstrap) return;
-    setBusy(true);
+    setLifecycleBusy(true);
     setNewSessionError(undefined);
     try {
       const created = await newSessionController.current.create(client, bootstrap.cwd);
@@ -848,33 +1137,39 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
       setNewSessionDraft(newSessionController.current.reset("chat"));
     } catch (cause) {
       setNewSessionError(cause instanceof Error ? cause.message : "Could not create a session");
-      setBusy(false);
+    } finally {
+      setLifecycleBusy(false);
     }
   };
 
   const renameSession = async (title: string): Promise<void> => {
     if (!opened) return;
-    setBusy(true); setSessionLifecycleError(undefined);
+    setLifecycleBusy(true); setSessionLifecycleError(undefined);
     try {
+      let appliedTitle = title;
       if (preview?.renameSession !== undefined) await preview.renameSession(title);
-      else if (client !== undefined && commandController.current !== undefined) {
-        await commandController.current.invoke(`/rename ${title}`, opened.sessionId);
+      else if (client !== undefined) {
+        // Use the typed rename RPC so the title is validated by the daemon rather
+        // than round-tripped through command-line parsing, and reflect exactly
+        // what was stored.
+        const result = await client.request("session.rename", { sessionId: opened.sessionId, title });
+        appliedTitle = result.title;
       } else throw new Error("Session rename is unavailable");
       if (client !== undefined) await refreshSessions(client);
-      else setSessions((current) => current.map((session) => session.sessionId === opened.sessionId ? { ...session, title } : session));
-      setOpened((current) => current === undefined ? current : { ...current, title });
+      else setSessions((current) => current.map((session) => session.sessionId === opened.sessionId ? { ...session, title: appliedTitle } : session));
+      setOpened((current) => current === undefined ? current : { ...current, title: appliedTitle });
       setSessionLifecycleOpen(false);
       showActionNotice("Session renamed");
     } catch (cause) {
       setSessionLifecycleError(cause instanceof Error ? cause.message : "Could not rename the session");
     } finally {
-      setBusy(false);
+      setLifecycleBusy(false);
     }
   };
 
   const cloneSession = async (): Promise<void> => {
     if (!opened) return;
-    setBusy(true); setSessionLifecycleError(undefined);
+    setLifecycleBusy(true); setSessionLifecycleError(undefined);
     try {
       const cloneOutcome =
         preview?.cloneSession === undefined && commandController.current !== undefined
@@ -897,28 +1192,19 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
         setWorkspaceBrowser({ path: "", entries: [], loaded: false });
         setWorkspaceReview(undefined);
         setWorkspaceCheckpointEnabled(undefined);
-        setSessions((current) => [{
-          sessionId: cloned.sessionId,
-          cwd: cloned.cwd,
-          ...(cloned.title === undefined ? {} : { title: cloned.title }),
-          createdAt: Date.now(),
-          updatedAt: Date.now(),
-          userMessageCount: 0,
-          runtime: cloned.runtime,
-          attachmentCount: 1,
-        }, ...current]);
+        setSessions((current) => [previewSessionSummary(cloned), ...current]);
         showActionNotice("Session cloned");
       }
     } catch (cause) {
       setSessionLifecycleError(cause instanceof Error ? cause.message : "Could not clone the session");
     } finally {
-      setBusy(false);
+      setLifecycleBusy(false);
     }
   };
 
   const exportArtifact = async (): Promise<void> => {
     if (!opened) return;
-    setBusy(true); setSessionLifecycleError(undefined);
+    setLifecycleBusy(true); setSessionLifecycleError(undefined);
     try {
       const artifact = preview?.exportSession !== undefined
         ? await preview.exportSession()
@@ -930,17 +1216,19 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
       document.body.append(anchor);
       anchor.click();
       anchor.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 0);
+      // Some browsers (Firefox) have not started the download on the next tick;
+      // keep the object URL alive briefly so the blob is still readable.
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
       showActionNotice("Session export downloaded");
     } catch (cause) {
       setSessionLifecycleError(cause instanceof Error ? cause.message : "Could not export the session");
     } finally {
-      setBusy(false);
+      setLifecycleBusy(false);
     }
   };
 
   const importArtifact = async (file: File): Promise<void> => {
-    setBusy(true); setError(undefined);
+    setLifecycleBusy(true); setError(undefined);
     try {
       const imported = preview?.importSession !== undefined
         ? await preview.importSession(file)
@@ -954,29 +1242,20 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
         setWorkspaceBrowser({ path: "", entries: [], loaded: false });
         setWorkspaceReview(undefined);
         setWorkspaceCheckpointEnabled(undefined);
-        setSessions((current) => [{
-          sessionId: imported.sessionId,
-          cwd: imported.cwd,
-          ...(imported.title === undefined ? {} : { title: imported.title }),
-          createdAt: Date.now(),
-          updatedAt: Date.now(),
-          userMessageCount: 0,
-          runtime: imported.runtime,
-          attachmentCount: 1,
-        }, ...current]);
+        setSessions((current) => [previewSessionSummary(imported), ...current]);
         showActionNotice("Session imported");
       }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not import the session");
     } finally {
-      setBusy(false);
+      setLifecycleBusy(false);
       if (artifactInput.current !== null) artifactInput.current.value = "";
     }
   };
 
   const disposeSession = async (): Promise<void> => {
     if (!opened) return;
-    setBusy(true); setSessionLifecycleError(undefined);
+    setLifecycleBusy(true); setSessionLifecycleError(undefined);
     try {
       if (preview?.disposeSession !== undefined) await preview.disposeSession();
       else if (client !== undefined) await client.request("session.dispose", { sessionId: opened.sessionId });
@@ -995,14 +1274,14 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
     } catch (cause) {
       setSessionLifecycleError(cause instanceof Error ? cause.message : "Could not end the session runtime");
     } finally {
-      setBusy(false);
+      setLifecycleBusy(false);
     }
   };
 
   const deleteSession = async (): Promise<void> => {
     if (!opened) return;
     const deletedSessionId = opened.sessionId;
-    setBusy(true); setSessionLifecycleError(undefined);
+    setLifecycleBusy(true); setSessionLifecycleError(undefined);
     openedSessionId.current = undefined;
     try {
       if (preview?.deleteSession !== undefined) await preview.deleteSession();
@@ -1022,17 +1301,15 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
         ? sessions.filter((session) => session.sessionId !== deletedSessionId)
         : await refreshSessions(client);
       setSessions(remaining);
-      if (client !== undefined && remaining[0] !== undefined) {
-        await openSession(client, remaining[0].sessionId);
-      } else {
-        showActionNotice("Session history deleted permanently");
-      }
+      // Return to the "No session selected" state instead of resuming another
+      // session (which could start a runtime the user did not ask for).
+      showActionNotice("Session history deleted permanently");
     } catch (cause) {
       openedSessionId.current = deletedSessionId;
       if (preview === undefined) retainBrowserSession(deletedSessionId);
       setSessionLifecycleError(cause instanceof Error ? cause.message : "Could not delete the session");
     } finally {
-      setBusy(false);
+      setLifecycleBusy(false);
     }
   };
 
@@ -1114,6 +1391,9 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
   };
 
   const shellPrecondition = (): string | undefined => {
+    if (!hasCapability("session.shell")) {
+      return "Shell access was not granted";
+    }
     if (conversation.activeOperationId !== undefined || pendingTurnDeliveries > 0) {
       return "Interrupt the active operation before running a shell command";
     }
@@ -1135,7 +1415,7 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
     const generation = selectionGeneration.current;
     const operationId = parseOperationId(crypto.randomUUID());
     directCancellationRequested.current = false;
-    setBusy(true);
+    setDirectBusy(true);
     report(undefined);
     setDirectOperation({ kind: "shell", sessionId: opened.sessionId, cancelling: false, source, command });
     try {
@@ -1167,7 +1447,7 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
       }
     } finally {
       if (generation === selectionGeneration.current) {
-        setBusy(false);
+        setDirectBusy(false);
         setDirectOperation(undefined);
         directCancellationRequested.current = false;
         if (source === "composer") queueMicrotask(() => composer.current?.focus());
@@ -1215,7 +1495,8 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
       !opened ||
       (!text && readyAttachments.length === 0) ||
       attachments.some((attachment) => attachment.status === "uploading") ||
-      busy
+      sessionSwitching ||
+      directBusy
     ) return;
     if (text.startsWith("!")) {
       await runShell(text);
@@ -1323,7 +1604,7 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
     }
     const controller = configurationController.current;
     if (!opened || controller === undefined) return;
-    setBusy(true); setModelActionError(undefined);
+    setModelActionError(undefined);
     try {
       await controller.configure(opened.sessionId, {
         providerId: choice.providerId,
@@ -1332,8 +1613,6 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
       await refreshCommandDirectory(opened.sessionId);
     } catch (cause) {
       setModelActionError(cause instanceof Error ? cause.message : "Could not change model");
-    } finally {
-      setBusy(false);
     }
   };
 
@@ -1344,14 +1623,12 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
     }
     const controller = configurationController.current;
     if (!opened || controller === undefined) return;
-    setBusy(true); setModelActionError(undefined);
+    setModelActionError(undefined);
     try {
       await controller.configure(opened.sessionId, { thinkingLevel });
       await refreshCommandDirectory(opened.sessionId);
     } catch (cause) {
       setModelActionError(cause instanceof Error ? cause.message : "Could not change effort");
-    } finally {
-      setBusy(false);
     }
   };
 
@@ -1368,12 +1645,6 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
     } catch {
       // The SDK controller publishes the failure beside the originating field.
     }
-  };
-
-  const showActionNotice = (message: string): void => {
-    setActionNotice(message);
-    if (actionNoticeTimer.current !== undefined) clearTimeout(actionNoticeTimer.current);
-    actionNoticeTimer.current = setTimeout(() => setActionNotice(undefined), 1800);
   };
 
   const copyMessage = async (text: string): Promise<void> => {
@@ -1412,6 +1683,7 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
   };
 
   const forkMessage = async (fromEventId: EventId): Promise<void> => {
+    setForkPicking(false);
     if (conversation.activeOperationId !== undefined) {
       setError("Finish or interrupt the current response before forking");
       return;
@@ -1422,7 +1694,7 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
     }
     const controller = commandController.current;
     if (!client || !opened || controller === undefined) return;
-    setBusy(true); setError(undefined);
+    setSessionSwitching(true); setError(undefined);
     try {
       const outcome = await controller.invoke(`/fork ${fromEventId}`, opened.sessionId);
       if (outcome.state !== "open-session") throw new Error("Fork did not open a session");
@@ -1431,7 +1703,7 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
       setDraft(outcome.session.selectedText ?? "");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not fork the session");
-      setBusy(false);
+      setSessionSwitching(false);
     }
   };
 
@@ -1442,10 +1714,11 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
       await client.reconnect();
       await refreshSessions(client);
       await refreshCommandDirectory(opened?.sessionId);
+      // The daemon owns the session across a reconnect, so its checkpoint state
+      // is already authoritative. Reset only the client-side generation cache;
+      // never replay a checkpoint mutation from browser memory, which would
+      // silently re-enable checkpoints a user disabled from another client.
       workspaceController.current?.reset();
-      if (workspaceCheckpointEnabled === true) {
-        await workspaceController.current?.checkpoint(true);
-      }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not reconnect to the daemon");
     }
@@ -1506,17 +1779,22 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
     try {
       const result = await operations.list(path, cursor);
       if (!current()) return;
-      setWorkspaceBrowser((state) => ({
-        ...state,
-        path,
-        entries: append && state.path === path
-          ? [...state.entries, ...result.entries]
-          : result.entries,
-        loaded: true,
-        ...(result.nextPageCursor === undefined
-          ? {}
-          : { nextPageCursor: result.nextPageCursor }),
-      }));
+      setWorkspaceBrowser((state) => {
+        // Drop any prior cursor first so the final page (which returns none)
+        // clears "Load more" instead of re-appending the last page.
+        const { nextPageCursor: _priorCursor, ...rest } = state;
+        return {
+          ...rest,
+          path,
+          entries: append && state.path === path
+            ? [...state.entries, ...result.entries]
+            : result.entries,
+          loaded: true,
+          ...(result.nextPageCursor === undefined
+            ? {}
+            : { nextPageCursor: result.nextPageCursor }),
+        };
+      });
     } catch (cause) {
       if (current())
         setBrowserError(cause instanceof Error ? cause.message : "Could not list workspace files");
@@ -1628,11 +1906,12 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
     let restoreComposerFocus = true;
     directCancellationRequested.current = false;
     setDraft("");
-    setBusy(true);
+    setDirectBusy(true);
     setError(undefined);
     if (compacting && opened !== undefined) {
       setDirectOperation({ kind: "compaction", sessionId: opened.sessionId, cancelling: false });
     }
+    if (compacting) mascotControl.current?.director.compactionStarted();
     try {
       const outcome = previewCompact !== null && preview?.compact !== undefined
         ? (await preview.compact(previewCompact[1]?.trim() || undefined, setConversation), {
@@ -1667,16 +1946,28 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
       }
       if (outcome.state === "completed") {
         if (outcome.command === "rename" && client !== undefined) await refreshSessions(client);
+        // Browser extension commands report their own result through api.ui.notify.
+        if (webExtensionRef.current?.commands().some((command) => command.name === outcome.command)) return;
         showActionNotice(
-          compacting && directCancellationRequested.current
-            ? "Compaction cancelled"
-            : `/${outcome.command} completed`,
+          outcome.content ??
+            (compacting && directCancellationRequested.current
+              ? "Compaction cancelled"
+              : `/${outcome.command} completed`),
         );
+        return;
+      }
+      if (outcome.state === "queued") {
+        showActionNotice(`/${outcome.command} queued after the active response`);
         return;
       }
       if (outcome.surface === "model" || outcome.surface === "thinking") {
         setModelPickerInitialFocus(outcome.surface);
         setModelPickerOpenRequest((current) => current + 1);
+      } else if (outcome.surface === "mcp") {
+        setUsageOpen(false);
+        setTranscriptSearchOpen(false);
+        setControlCenter("mcp");
+        void loadMcpConfiguration();
       } else if (
         outcome.surface === "providers" ||
         outcome.surface === "login" ||
@@ -1696,7 +1987,7 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
         setSidebarCollapsed(false);
         setSidebarOpen(true);
       } else if (outcome.surface === "fork") {
-        showActionNotice("Choose Fork on the message where the new session should begin");
+        setForkPicking(true);
       } else if (outcome.surface === "requeue") {
         restoreComposerFocus = false;
         setRequeueError(undefined);
@@ -1720,12 +2011,13 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
       }
     } catch (cause) {
       if (generation !== selectionGeneration.current) return;
-      setDraft(input);
+      setDraft((current) => restoreDraft(input, current));
       if (compacting && directCancellationRequested.current) showActionNotice("Compaction cancelled");
       else setError(cause instanceof Error ? cause.message : "Command failed");
     } finally {
+      if (compacting) mascotControl.current?.director.compactionFinished();
       if (generation === selectionGeneration.current) {
-        setBusy(false);
+        setDirectBusy(false);
         if (compacting) setDirectOperation(undefined);
         directCancellationRequested.current = false;
         if (restoreComposerFocus) queueMicrotask(() => composer.current?.focus());
@@ -1824,11 +2116,15 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
   };
 
   const currentPreferences = (): WebPreferences => ({
+    loungeOpen,
+    mascot: mascotOn,
+    mascotColour,
     sidebarWidth,
     dockWidth,
     sidebarCollapsed,
     changesView,
     panes: paneLayout.panes,
+    theme,
   });
 
   const applyPaneLayout = (layout: PaneLayout): void => {
@@ -1862,7 +2158,7 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
 
   const togglePaneOpen = (pane: PaneId): void => {
     const next = togglePane(paneLayout, pane);
-    if (next.panes.includes(pane) && matchMedia("(max-width: 1180px)").matches) {
+    if (next.panes.includes(pane) && compactDock) {
       setSidebarOpen(false);
       setMobileDock(true);
     }
@@ -1880,14 +2176,155 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
     );
   };
 
+  const toggleLounge = (open = !loungeOpen): void => {
+    setLoungeOpen(open);
+    persistLayout({ ...currentPreferences(), loungeOpen: open });
+  };
+  const toggleLoungeRef = useRef(toggleLounge);
+  toggleLoungeRef.current = toggleLounge;
+
+  const toggleMascot = (argument?: string): void => {
+    if (argument === "sas") {
+      if (mascotControl.current === null) throw new Error("/mascot sas needs the mascot on");
+      // A one-shot that plays over whatever is running and hands back on its own.
+      mascotControl.current.player.play("sass");
+      return;
+    }
+    if (argument !== undefined && !MASCOT_COLOURS.includes(argument)) {
+      throw new Error(`Mascot colour must be one of ${MASCOT_COLOURS.join(", ")}, or sas`);
+    }
+    if (mascotOn && (argument === undefined || argument === mascotColour)) {
+      setMascotOn(false);
+      persistLayout({ ...currentPreferences(), mascot: false });
+      return;
+    }
+    const colour = argument ?? mascotColour;
+    setMascotColour(colour);
+    setMascotOn(true);
+    persistLayout({ ...currentPreferences(), mascot: true, mascotColour: colour });
+  };
+  const toggleMascotRef = useRef(toggleMascot);
+  toggleMascotRef.current = toggleMascot;
+
+  const updateLoungeSettings = (update: Partial<LoungeSettings>): void => {
+    setLoungeSettings((current) => current === undefined ? current : { ...current, ...update });
+    void saveLoungeSettings(update).catch((cause: unknown) =>
+      setError(cause instanceof Error ? cause.message : "Could not save Lounge settings"),
+    );
+  };
+
   const applyWebPreferences = (preferences: WebPreferences): void => {
+    setTheme(preferences.theme);
     setSidebarWidth(preferences.sidebarWidth);
     setDockWidth(preferences.dockWidth);
     setSidebarCollapsed(preferences.sidebarCollapsed);
     setChangesView(preferences.changesView);
+    setLoungeOpen(preferences.loungeOpen);
+    setMascotOn(preferences.mascot);
+    setMascotColour(preferences.mascotColour);
     if (preferences.panes.join() !== paneLayout.panes.join()) setPaneLayout(createPaneLayout(preferences.panes));
     persistLayout(preferences);
   };
+
+  const loadMcpConfiguration = async (): Promise<void> => {
+    if (client === undefined || !hasCapability("mcp.config.list")) return;
+    setMcpBusy(true);
+    setMcpError(undefined);
+    try {
+      setMcpConfiguration(await client.listMcpServers());
+    } catch (cause) {
+      setMcpError(cause instanceof Error ? cause.message : "Could not load MCP configuration");
+    } finally {
+      setMcpBusy(false);
+    }
+  };
+
+  const reloadAfterMcpChange = async (notice: string): Promise<void> => {
+    if (client === undefined) return;
+    if (opened !== undefined) await commandController.current?.invoke("/reload", opened.sessionId);
+    setMcpConfiguration(await client.listMcpServers());
+    showActionNotice(notice);
+  };
+
+  /** Probe first, save only when the server answers, then reload. Errors surface in the form. */
+  const addMcpServer = async (name: string, definition: McpServerDefinition): Promise<void> => {
+    if (client === undefined) throw new Error("The daemon connection is unavailable");
+    setMcpBusy(true);
+    setMcpError(undefined);
+    try {
+      const probed = await client.probeMcpServer({ name, definition });
+      await client.upsertMcpServer({ name, definition });
+      await reloadAfterMcpChange(
+        probed.authorization === "required"
+          ? `MCP server ${name} added · authorize it in your browser when prompted`
+          : `MCP server ${name} added · ${probed.tools.length} tool${probed.tools.length === 1 ? "" : "s"}`,
+      );
+    } finally {
+      setMcpBusy(false);
+    }
+  };
+
+  const importMcpServers = async (
+    servers: readonly { readonly name: string; readonly definition: McpServerDefinition }[],
+  ): Promise<void> => {
+    if (client === undefined) throw new Error("The daemon connection is unavailable");
+    setMcpBusy(true);
+    setMcpError(undefined);
+    try {
+      let tools = 0;
+      const needsAuthorization: string[] = [];
+      for (const server of servers) {
+        try {
+          const probed = await client.probeMcpServer(server);
+          tools += probed.tools.length;
+          if (probed.authorization === "required") needsAuthorization.push(server.name);
+        } catch (cause) {
+          throw new Error(`${server.name}: ${cause instanceof Error ? cause.message : "connection failed"}`);
+        }
+      }
+      await client.batchUpsertMcpServers({ servers });
+      const subject =
+        servers.length === 1 ? `MCP server ${servers[0]?.name}` : `${servers.length} MCP servers`;
+      await reloadAfterMcpChange(
+        needsAuthorization.length > 0
+          ? `${subject} added · ${needsAuthorization.join(", ")}: authorize in your browser when prompted`
+          : `${subject} added · ${tools} tool${tools === 1 ? "" : "s"}`,
+      );
+    } finally {
+      setMcpBusy(false);
+    }
+  };
+
+  const mutateMcpServer = async (notice: string, action: () => Promise<unknown>): Promise<void> => {
+    if (client === undefined) return;
+    setMcpBusy(true);
+    setMcpError(undefined);
+    try {
+      await action();
+      await reloadAfterMcpChange(notice);
+    } catch (cause) {
+      setMcpError(cause instanceof Error ? cause.message : "Could not update MCP configuration");
+    } finally {
+      setMcpBusy(false);
+    }
+  };
+
+  const removeMcpServer = (name: string): Promise<void> =>
+    mutateMcpServer(`MCP server ${name} removed`, () => client?.removeMcpServer({ name }) ?? Promise.resolve());
+
+  const setMcpServerEnabled = (name: string, enabled: boolean): Promise<void> =>
+    mutateMcpServer(`MCP server ${name} ${enabled ? "enabled" : "disabled"}`, async () => {
+      const current = mcpConfiguration?.servers.find((server) => server.name === name)
+        ?? (await client?.listMcpServers())?.servers.find((server) => server.name === name);
+      if (current === undefined) throw new Error(`MCP server ${name} is no longer configured`);
+      const { enabled: _previous, ...rest } = current.definition;
+      await client?.upsertMcpServer({ name, definition: enabled ? rest : { ...rest, enabled: false } });
+    });
+
+  const mcpActiveIdentities = useMemo(
+    () => new Set(conversation.activeCapabilities.map((event) => event.payload.capability.identity)),
+    [conversation.activeCapabilities],
+  );
 
   const refreshProviders = async (providerId?: string): Promise<void> => {
     setProviderActionError(undefined);
@@ -1974,7 +2411,7 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
   };
 
   const toggleSidebar = (): void => {
-    if (matchMedia("(max-width: 760px)").matches) {
+    if (narrowFrame) {
       setSidebarOpen(false);
       return;
     }
@@ -1986,8 +2423,8 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
   const dockOpen = paneLayout.panes.length > 0;
   const effectiveDockWidth = dockOpen ? dockWidth : 0;
   const clampWidth = (side: "left" | "right", value: number): number => side === "left"
-    ? Math.round(Math.max(SIDEBAR_WIDTH_RANGE.min, Math.min(SIDEBAR_WIDTH_RANGE.max, value, window.innerWidth - effectiveDockWidth - 520)))
-    : Math.round(Math.max(DOCK_WIDTH_RANGE.min, Math.min(DOCK_WIDTH_RANGE.max, value, window.innerWidth - (sidebarCollapsed ? 56 : sidebarWidth) - 520)));
+    ? Math.round(Math.max(SIDEBAR_WIDTH_RANGE.min, Math.min(SIDEBAR_WIDTH_RANGE.max, value, frameSize.width - effectiveDockWidth - 520)))
+    : Math.round(Math.max(DOCK_WIDTH_RANGE.min, Math.min(DOCK_WIDTH_RANGE.max, value, frameSize.width - (sidebarCollapsed ? 56 : sidebarWidth) - 520)));
 
   const resizePanelBy = (side: "left" | "right", delta: number): void => {
     const next = clampWidth(side, (side === "left" ? sidebarWidth : dockWidth) + delta);
@@ -2005,7 +2442,9 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
     let next = side === "left" ? sidebarWidth : dockWidth;
     document.body.classList.add("resizing-panels");
     const move = (event: PointerEvent): void => {
-      next = clampWidth(side, side === "left" ? event.clientX : window.innerWidth - event.clientX);
+      const frame = frameRef.current?.getBoundingClientRect();
+      if (frame === undefined) return;
+      next = clampWidth(side, side === "left" ? event.clientX - frame.left : frame.right - event.clientX);
       if (side === "left") setSidebarWidth(next);
       else setDockWidth(next);
     };
@@ -2036,6 +2475,10 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
   const promptBreakpoints = useMemo(() => transcriptPromptBreakpoints(conversation), [conversation]);
   const transcriptMatches = useMemo(() => transcriptMessageMatches(conversation, transcriptQuery), [conversation, transcriptQuery]);
   const usageStats = useMemo(() => sessionUsageStats(conversation), [conversation]);
+  const displayConversation = useMemo(
+    () => webExtensions?.display(conversation) ?? conversation,
+    [conversation, webExtensions, extensionRevision],
+  );
   const stateHistory = useMemo(() => sessionStateHistory(conversation), [conversation]);
   const pausedQueue = useMemo(() => pausedQueueItems(conversation.queue), [conversation.queue]);
   const peers = useMemo(
@@ -2048,6 +2491,10 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
     [commands, draft],
   );
   const connected = connection === "connected";
+  // Work that owns the composer: switching sessions replaces the transcript,
+  // and a composer-initiated shell or command consumes the draft. Model and
+  // lifecycle work deliberately do not gate the composer.
+  const composerBusy = sessionSwitching || directBusy;
   const configurationPending = configurationState.pending.length > 0;
   const webToolPending = configurationState.pending.filter(
     (field): field is WebToolField => field === "webSearch" || field === "webFetch",
@@ -2137,19 +2584,38 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
     if (id !== undefined) jumpToMessage(id);
   };
 
+  const scrollToLatest = (): void => {
+    const viewport = transcript.current;
+    if (viewport === null) return;
+    stickToBottom.current = true;
+    viewport.scrollTo({ top: viewport.scrollHeight });
+    setShowJumpToLatest(false);
+  };
+
   const trackTranscriptScroll = (): void => {
     const viewport = transcript.current;
     if (viewport === null) return;
+    const atBottom = isScrolledToBottom(viewport);
+    stickToBottom.current = atBottom;
+    if (atBottom) setShowJumpToLatest(false);
     setTranscriptNavigationVisible(true);
     if (transcriptNavigationTimer.current !== undefined) clearTimeout(transcriptNavigationTimer.current);
     transcriptNavigationTimer.current = setTimeout(() => setTranscriptNavigationVisible(false), 1400);
-    const threshold = viewport.getBoundingClientRect().top + 120;
-    let active = promptBreakpoints[0]?.id;
-    for (const point of promptBreakpoints) {
-      const element = document.getElementById(`message-${point.id}`);
-      if (element !== null && element.getBoundingClientRect().top <= threshold) active = point.id;
-    }
-    setActivePromptId(active);
+    // Scroll events can fire many times per frame; coalesce the O(n) active
+    // breakpoint scan (one DOM lookup per prompt) to at most once per frame.
+    if (scrollRaf.current !== undefined) return;
+    scrollRaf.current = requestAnimationFrame(() => {
+      scrollRaf.current = undefined;
+      const current = transcript.current;
+      if (current === null) return;
+      const threshold = current.getBoundingClientRect().top + 120;
+      let active = promptBreakpoints[0]?.id;
+      for (const point of promptBreakpoints) {
+        const element = document.getElementById(`message-${point.id}`);
+        if (element !== null && element.getBoundingClientRect().top <= threshold) active = point.id;
+      }
+      setActivePromptId(active);
+    });
   };
 
   const paneUnavailableReasons: Readonly<Record<PaneId, string | undefined>> = {
@@ -2160,37 +2626,72 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
   };
   const terminalRecords = useMemo(() => terminalEntries(conversation), [conversation]);
 
-  return <main className={`shell${sidebarCollapsed && !sidebarOpen ? " sidebar-collapsed" : ""}${dockOpen ? " dock-open" : ""}${mobileDock ? " mobile-dock" : ""}`} style={{ "--sidebar-width": `${sidebarWidth}px`, "--dock-width": `${dockWidth}px` } as CSSProperties}>
+  // Referentially stable callbacks for the transcript. The row memo in
+  // @axl/ui skips unchanged history only when these props keep their identity
+  // across streaming re-renders, so the message handlers are dispatched through
+  // a ref that always holds the latest closures. resolveBlobUrl intentionally
+  // changes identity when blobUrls change so rows with pending images refresh.
+  const transcriptHandlers = useRef({ copyMessage, respondInteraction, loadFullToolOutput, forkMessage });
+  transcriptHandlers.current = { copyMessage, respondInteraction, loadFullToolOutput, forkMessage };
+  const stableCopyMessage = useCallback((text: string) => void transcriptHandlers.current.copyMessage(text), []);
+  const stableForkMessage = useCallback((eventId: EventId) => void transcriptHandlers.current.forkMessage(eventId), []);
+  const stableRespondInteraction = useCallback(
+    (interactionId: string, action: InteractionAction, content?: JsonObject) =>
+      transcriptHandlers.current.respondInteraction(interactionId, action, content),
+    [],
+  );
+  const stableLoadFullToolOutput = useCallback(
+    (tool: ProjectedToolCall, blob: BlobReference) =>
+      transcriptHandlers.current.loadFullToolOutput(tool, blob),
+    [],
+  );
+  const stableResolveBlobUrl = useCallback(
+    (blob: BlobReference) => preview?.resolveBlobUrl?.(blob.sha256) ?? blobUrls.get(blob.sha256),
+    [preview, blobUrls],
+  );
+  const canLoadFullOutput =
+    hasCapability("session.blob.read") && (preview?.readBlob !== undefined || client !== undefined);
+
+  if (authRequired) return <AuthRequired />;
+
+  const showLounge = bootstrap?.lounge !== undefined && loungeSettings !== undefined && loungeOpen;
+
+  return <div className={`lounge-layout${showLounge ? " with-lounge" : ""}`}>
+    <div ref={frameRef} className="app-frame">
+    <main className={`shell${sidebarCollapsed && !sidebarOpen ? " sidebar-collapsed" : ""}${dockOpen ? " dock-open" : ""}${mobileDock ? " mobile-dock" : ""}`} style={{ "--sidebar-width": `${sidebarWidth}px`, "--dock-width": `${dockWidth}px` } as CSSProperties}>
     <CommandPalette commands={commands} open={commandPaletteOpen} {...(commandPaletteError === undefined ? {} : { error: commandPaletteError })} onClose={() => { setCommandPaletteOpen(false); setCommandPaletteError(undefined); }} onSelect={selectCommand} />
     <button ref={mobileMenu} className="mobile-menu" aria-label="Open sessions" aria-controls="session-sidebar" aria-expanded={sidebarOpen} onClick={() => { setMobileDock(false); setSidebarOpen(true); }}><span></span><span></span><span></span></button>
     {sidebarOpen && <button className="scrim" aria-label="Close sessions" onClick={() => setSidebarOpen(false)} />}
     <aside id="session-sidebar" ref={sidebarPanel} className={sidebarOpen ? "sidebar open" : "sidebar"} aria-label="Sessions" role={sidebarOpen ? "dialog" : undefined} aria-modal={sidebarOpen || undefined} inert={mobileDock} onKeyDown={(event) => { if (sidebarOpen) trapDialogFocus(event, sidebarPanel.current); }}>
       <div className="brand"><span className="brand-mark">A</span><strong>Axl</strong><button ref={sidebarClose} className="sidebar-toggle" aria-label={sidebarOpen ? "Close sessions" : sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"} onClick={toggleSidebar}><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="2.5" width="12" height="11" rx="1.5" /><path d="M6 2.5v11m4.5-8L8 8l2.5 2.5" /></svg></button></div>
-      <div className="workspace-actions"><span>Workspace</span><div>{canImport && <button aria-label="Import session" title="Import session" disabled={busy} onClick={() => artifactInput.current?.click()}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2v8m-3-3 3 3 3-3M3 13h10" /></svg></button>}<button aria-label="New session" title={canCreate ? "New session" : "Unavailable because session creation was not granted"} disabled={busy || !canCreate} onClick={() => openNewSession()}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg></button></div><input ref={artifactInput} className="attachment-input" type="file" accept="application/json,.json" tabIndex={-1} aria-hidden="true" onChange={(event) => { const file = event.target.files?.[0]; if (file !== undefined) void importArtifact(file); }} /></div>
+      <div className="workspace-actions"><span>Workspace</span><div>{canImport && <button aria-label="Import session" title="Import session" disabled={lifecycleBusy || sessionSwitching} onClick={() => artifactInput.current?.click()}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2v8m-3-3 3 3 3-3M3 13h10" /></svg></button>}<button aria-label="New session" title={canCreate ? "New session" : "Unavailable because session creation was not granted"} disabled={lifecycleBusy || sessionSwitching || !canCreate} onClick={() => openNewSession()}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg></button></div><input ref={artifactInput} className="attachment-input" type="file" accept="application/json,.json" tabIndex={-1} aria-hidden="true" onChange={(event) => { const file = event.target.files?.[0]; if (file !== undefined) void importArtifact(file); }} /></div>
       <label className="search"><span aria-hidden="true">⌕</span><input type="search" value={query} onChange={(event) => setQuery(event.target.value)} aria-label="Search sessions" placeholder="Search sessions" /></label>
-      <nav>{visibleSessions.map((session) => <button key={session.sessionId} aria-label={`${sessionTitle(session)}, ${session.runtime.state}`} className={session.sessionId === opened?.sessionId ? "session active" : "session"} onClick={() => client && void openSession(client, session.sessionId)}><span className={`session-icon ${session.runtime.state}`} aria-hidden="true"><svg viewBox="0 0 16 16"><path d="M3 3.5h10v7H7l-3 2v-2H3z" /></svg></span><span><strong>{sessionTitle(session)}</strong><small>{session.cwd}</small></span></button>)}{visibleSessions.length === 0 && <p className="no-sessions">No matching sessions</p>}</nav>
+      <nav>{visibleSessions.map((session) => <button key={session.sessionId} aria-label={`${sessionTitle(session)}, ${session.runtime.state}`} className={session.sessionId === opened?.sessionId ? "session active" : "session"} onClick={() => client && void openSession(client, session.sessionId)}><span className={`session-icon ${session.runtime.state}`} aria-hidden="true"><svg viewBox="0 0 16 16"><path d="M3 3.5h10v7H7l-3 2v-2H3z" /></svg></span><span><strong>{sessionTitle(session)}</strong><small>{session.profile === "chat" ? "Chat" : session.cwd}</small></span></button>)}{visibleSessions.length === 0 && <p className="no-sessions">No matching sessions</p>}{sessionsCursor !== undefined && <button type="button" className="load-more-sessions" disabled={loadingMoreSessions} onClick={() => void loadMoreSessions()}>{loadingMoreSessions ? "Loading…" : "Load more sessions"}</button>}</nav>
       <button className="daemon" aria-label={connection === "disconnected" && client !== undefined ? "Reconnect local daemon" : "Open settings"} aria-expanded={controlCenter !== undefined} onClick={() => { if (connection === "disconnected" && client !== undefined) { void reconnect(); return; } setUsageOpen(false); setTranscriptSearchOpen(false); setControlCenter("settings"); }}><span className={`daemon-status ${connection}`} aria-hidden="true"></span><span><strong>Local daemon</strong><small>{connection === "disconnected" && client === undefined ? "Connection unavailable" : DAEMON_CONNECTION_LABELS[connection]}</small></span>{connection === "disconnected" && client !== undefined ? <svg className="daemon-action" viewBox="0 0 16 16" aria-hidden="true"><path d="M13 6a5 5 0 1 0 .2 3M13 2.5V6H9.5" /></svg> : <svg className="daemon-action" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="2.25" /><path d="M8 1.75v1.5M8 12.75v1.5M1.75 8h1.5M12.75 8h1.5M3.6 3.6l1.05 1.05M11.35 11.35l1.05 1.05M12.4 3.6l-1.05 1.05M4.65 11.35 3.6 12.4" /></svg>}</button>
       {!sidebarCollapsed && <div className="panel-resizer left" role="separator" aria-orientation="vertical" aria-label="Resize session sidebar" aria-valuemin={200} aria-valuemax={420} aria-valuenow={sidebarWidth} aria-valuetext={`${sidebarWidth} pixels wide`} aria-keyshortcuts="ArrowLeft ArrowRight" tabIndex={0} onPointerDown={(event) => resizePanel("left", event)} onKeyDown={(event) => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); resizePanelBy("left", event.key === "ArrowLeft" ? -16 : 16); } }} />}
     </aside>
     <section className="workspace" inert={sidebarOpen || mobileDock}>
       <header className="topbar"><div><span className="crumb">Sessions</span><span className="separator">›</span><strong>{opened ? currentTitle : "Select a session"}</strong>{opened && <span className={`session-profile ${opened.profile}`}>{opened.profile === "chat" ? "Chat" : opened.profile === "standard" ? "Code" : opened.profile}</span>}{peers.length > 0 && <span className="session-presence" role="status" aria-label={peerDescription} title={peerDescription}><i aria-hidden="true"></i>{peers.length} other</span>}</div><div className="top-actions"><button className="command-toggle" aria-label="Open command palette" title="Commands (Ctrl+K)" onClick={() => { setCommandPaletteError(undefined); setCommandPaletteOpen(true); void refreshCommandDirectory(opened?.sessionId).catch((cause: unknown) => setCommandPaletteError(cause instanceof Error ? cause.message : "Could not refresh commands")); }}>/</button>{opened && canManageSession && <button className={sessionLifecycleOpen ? "session-manage active" : "session-manage"} aria-label="Manage session" aria-expanded={sessionLifecycleOpen} onClick={() => { setControlCenter(undefined); setSessionLifecycleError(undefined); setSessionLifecycleOpen(true); }}><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="3" cy="8" r="1" /><circle cx="8" cy="8" r="1" /><circle cx="13" cy="8" r="1" /></svg></button>}{opened && <button ref={usageToggle} className={usageOpen ? "usage-toggle active" : "usage-toggle"} aria-label="Show session usage" aria-expanded={usageOpen} onClick={() => { setControlCenter(undefined); setTranscriptSearchOpen(false); setUsageOpen((open) => !open); }}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 12V8M8 12V4M13 12V6" /></svg><span>Usage</span></button>}{opened && <button className={transcriptSearchOpen ? "transcript-search-toggle active" : "transcript-search-toggle"} aria-label="Search transcript" aria-expanded={transcriptSearchOpen} onClick={() => { setControlCenter(undefined); setUsageOpen(false); setTranscriptSearchOpen((open) => !open); }}><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.25" /><path d="m10.25 10.25 3 3" /></svg></button>}{opened && dockOpen && <button ref={mobileDockToggle} type="button" className="mobile-dock-toggle" aria-label="Show panes" aria-controls="pane-dock" aria-expanded={mobileDock} onClick={() => { setSidebarOpen(false); setMobileDock(true); }}><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="2.5" width="12" height="11" rx="1.5" /><path d="M9 2.5v11M9 8h5" /></svg></button>}{opened && <PanePicker openPanes={paneLayout.panes} unavailableReasons={paneUnavailableReasons} badges={workspaceReview === undefined ? {} : { changes: workspaceReview.status.entries.length }} onToggle={togglePaneOpen} />}</div></header>
-      {opened && conversation.sandbox?.enforced === false && <div className="unsafe-banner" role="alert"><strong>Unsafe session</strong><span>Sandbox enforcement is disabled. Tools run with your host permissions.</span></div>}
+      {opened && (conversation.sandbox?.enforced === false || (webExtensions?.statuses().length ?? 0) > 0) && <div className="workspace-notices">{conversation.sandbox?.enforced === false && <div className="unsafe-banner" role="alert"><strong>Unsafe session</strong><span>Sandbox enforcement is disabled. Tools run with your host permissions.</span></div>}{webExtensions && webExtensions.statuses().length > 0 && <div className="extension-statuses" role="status" aria-label="Extension status">{webExtensions.statuses().map((status, index) => <span key={index}>{status}</span>)}</div>}</div>}
       {usageOpen && <section ref={usagePanel} className="session-usage" aria-label="Session usage"><header><strong>Session usage</strong><button type="button" aria-label="Close session usage" onClick={() => setUsageOpen(false)}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8" /></svg></button></header><p>{conversation.provider && conversation.model ? `${conversation.provider} / ${conversation.model}` : conversation.model ?? "No model selected"}{conversation.thinking ? ` · ${conversation.thinking}` : ""}</p><dl><div><dt>Input</dt><dd>{compactNumber(conversation.usage.inputTokens)}</dd></div><div><dt>Output</dt><dd>{compactNumber(conversation.usage.outputTokens)}</dd></div><div><dt>Cache read</dt><dd>{compactNumber(conversation.usage.cacheReadTokens)}</dd></div><div><dt>Cache hit</dt><dd>{usageStats.cacheHitPercent.toFixed(1)}%</dd></div><div><dt>Reasoning</dt><dd>{compactNumber(conversation.usage.reasoningTokens)}</dd></div><div><dt>Throughput</dt><dd>{usageStats.tokensPerSecond === undefined ? "Unknown" : `${usageStats.tokensPerSecond.toFixed(1)} tok/s`}</dd></div><div><dt>Recorded cost</dt><dd>${conversation.usage.costUsd.toFixed(4)}</dd></div></dl>{usageStats.unknownCostResponses > 0 && <small>{usageStats.unknownCostResponses} response{usageStats.unknownCostResponses === 1 ? " has" : "s have"} no cost data.</small>}{stateHistory.length > 0 && <details className="state-history"><summary>Configuration history</summary><ol>{stateHistory.map((entry) => <li key={entry.id}><span><strong>{entry.label}</strong><small>{entry.detail}</small></span><time>{new Date(entry.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time></li>)}</ol></details>}</section>}
       {transcriptSearchOpen && <div className="transcript-search" role="search"><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.25" /><path d="m10.25 10.25 3 3" /></svg><input autoFocus type="search" aria-label="Search transcript" placeholder="Search transcript" value={transcriptQuery} onChange={(event) => setTranscriptQuery(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); moveTranscriptMatch(event.shiftKey ? -1 : 1); } }} /><span>{transcriptQuery.trim() ? `${transcriptMatches.length === 0 ? 0 : Math.max(0, transcriptMatch + 1)} / ${transcriptMatches.length}` : ""}</span><button type="button" aria-label="Previous result" disabled={transcriptMatches.length === 0} onClick={() => moveTranscriptMatch(-1)}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 10 4-4 4 4" /></svg></button><button type="button" aria-label="Next result" disabled={transcriptMatches.length === 0} onClick={() => moveTranscriptMatch(1)}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 6 4 4 4-4" /></svg></button><button type="button" aria-label="Close transcript search" onClick={() => { setTranscriptSearchOpen(false); setTranscriptQuery(""); }}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8" /></svg></button></div>}
-      <div className="thread" ref={transcript} onScroll={trackTranscriptScroll}>
-        {opened ? <div className="thread-inner"><div className="thread-title"><h1>{currentTitle}</h1>{opened.profile !== "chat" && <p>{opened.cwd}</p>}</div><Suspense fallback={null}><Conversation conversation={conversation} searchQuery={transcriptQuery} resolveBlobUrl={(blob) => preview?.resolveBlobUrl?.(blob.sha256) ?? blobUrls.get(blob.sha256)} loadFullToolOutput={hasCapability("session.blob.read") && (preview?.readBlob !== undefined || client !== undefined) ? loadFullToolOutput : undefined} onRespondInteraction={hasCapability("session.interaction.respond") ? respondInteraction : undefined} onCopyMessage={(text) => void copyMessage(text)} onForkMessage={hasCapability("session.fork") ? (eventId) => void forkMessage(eventId) : undefined} /></Suspense>{conversation.activity && <article className="message assistant live"><span className="avatar axl">A</span><div><header><strong>Axl</strong><time>working</time></header>{conversation.activity.thinking && <details><summary>Thinking</summary><p>{conversation.activity.thinking}</p></details>}<p className="waiting-response">{conversation.activity.text || "Waiting for response"}<span className="waiting-dots" aria-hidden="true"><i></i><i></i><i></i></span></p></div></article>}</div> : <div className="empty"><span className="brand-mark large">A</span><h1>No session selected</h1><p>Resume a durable session or start one in this workspace.</p><button title={canCreate ? undefined : "Unavailable because session creation was not granted"} disabled={!canCreate} onClick={() => openNewSession()}>New session</button></div>}
+      {forkPicking && <div className="fork-picking-bar" role="status"><span>Pick a message to fork from</span><button type="button" onClick={() => setForkPicking(false)}>Cancel</button></div>}
+      <div className={`thread${forkPicking ? " fork-picking" : ""}`} ref={transcript} onScroll={trackTranscriptScroll}>
+        {opened ? <div className="thread-inner"><div className="thread-title"><h1>{currentTitle}</h1>{opened.profile !== "chat" && <p>{opened.cwd}</p>}</div>{webExtensions?.widgetEntries().map(({ key, widget }) => typeof widget === "string" ? <aside className="extension-widget" key={key}>{widget}</aside> : <WebWidgetView key={key} host={webExtensions} widgetKey={key} onError={(message) => setError(message)} />)}<Suspense fallback={null}><Conversation conversation={displayConversation} renderTool={webExtensions ? (tool) => webExtensions.renderTool(tool.name, tool) : undefined} renderMessage={webExtensions ? (extensionId, source, event) => webExtensions.renderMessage(extensionId, source, event) : undefined} renderEntry={webExtensions ? (extensionId, channel, event) => webExtensions.renderEntry(extensionId, channel, event) : undefined} searchQuery={transcriptQuery} resolveBlobUrl={stableResolveBlobUrl} loadFullToolOutput={canLoadFullOutput ? stableLoadFullToolOutput : undefined} onRespondInteraction={hasCapability("session.interaction.respond") ? stableRespondInteraction : undefined} onCopyMessage={stableCopyMessage} onForkMessage={hasCapability("session.fork") ? stableForkMessage : undefined} /></Suspense>{conversation.activity && <article className="message assistant live"><span className="avatar axl">A</span><div><header><strong>Axl</strong><time>working</time></header>{conversation.activity.thinking && <details><summary>Thinking</summary><Suspense fallback={<p className="streaming-text">{conversation.activity.thinking}</p>}><LiveMarkdown text={conversation.activity.thinking} /></Suspense></details>}{conversation.activity.text ? <><Suspense fallback={<p className="streaming-text">{(webExtensions?.safeTransform(conversation.activity.text, "assistant") ?? conversation.activity.text)}</p>}><LiveMarkdown text={(webExtensions?.safeTransform(conversation.activity.text, "assistant") ?? conversation.activity.text)} /></Suspense><p className="waiting-response" aria-hidden="true"><span className="waiting-dots"><i></i><i></i><i></i></span></p></> : <p className="waiting-response">Waiting for response<span className="waiting-dots" aria-hidden="true"><i></i><i></i><i></i></span></p>}</div></article>}</div> : <div className="empty"><span className="brand-mark large">A</span><h1>No session selected</h1><p>Resume a durable session or start one in this workspace.</p><button title={canCreate ? undefined : "Unavailable because session creation was not granted"} disabled={!canCreate} onClick={() => openNewSession()}>New session</button></div>}
       </div>
+      {opened && showJumpToLatest && <div className="jump-to-latest"><button type="button" onClick={scrollToLatest} aria-label="Jump to latest message"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v9m0 0 4-4m-4 4-4-4" /></svg>Jump to latest</button></div>}
       {promptBreakpoints.length > 1 && <nav className={`prompt-breakpoints${transcriptNavigationVisible || transcriptSearchOpen ? " visible" : ""}`} aria-label="Conversation prompts" onMouseEnter={() => { if (transcriptNavigationTimer.current !== undefined) clearTimeout(transcriptNavigationTimer.current); setTranscriptNavigationVisible(true); }} onMouseLeave={() => setTranscriptNavigationVisible(false)}>{promptBreakpoints.map((point) => <button type="button" key={point.id} className={point.id === activePromptId ? "active" : ""} title={point.text} onClick={() => jumpToMessage(point.id)}><span>{point.text}</span></button>)}</nav>}
       {!connected && <div className="connection-banner" role="status" aria-live="polite"><span>{connection === "disconnected" ? "Connection to the daemon was lost." : connection === "incompatible" ? "The browser and daemon versions are incompatible." : "Connecting to the daemon…"}</span>{connection === "disconnected" && client !== undefined && <button onClick={() => void reconnect()}>Reconnect</button>}</div>}
       {actionNotice && !error && <div className="action-notice" role="status">{actionNotice}</div>}
       {error && <div className="error-banner" role="alert"><span>{error}</span><button aria-label="Dismiss error" onClick={() => setError(undefined)}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8" /></svg></button></div>}
       {directOperation && directOperation.source !== "terminal" && <div className="direct-operation" role="status" aria-live="polite"><progress aria-label={directOperation.kind === "compaction" ? "Compaction progress" : "Shell command progress"} /><span><strong>{directOperation.kind === "compaction" ? "Compacting context" : "Running shell command"}</strong><small>{directOperation.kind === "compaction" ? "Summarizing older context into a durable checkpoint." : "The sandboxed command result will appear in the transcript."}</small></span><button type="button" disabled={directOperation.cancelling} onClick={() => void cancelDirectOperation()}>{directOperation.cancelling ? "Cancelling…" : "Cancel"}</button></div>}
-      {opened && <form className="composer" onSubmit={(event) => { event.preventDefault(); if (canDeliver) void send(); }}>{slashCommands.length > 0 && <div className="slash-commands" role="listbox" aria-label="Slash commands">{slashCommands.map((command) => <button key={command.id} type="button" role="option" aria-selected={command === slashCommands[slashCommandIndex]} disabled={command.availability.state === "unavailable"} onClick={() => selectCommand(command)}><strong>/{command.name}</strong><span>{command.availability.state === "unavailable" ? command.availability.reason : command.description}</span></button>)}</div>}<input ref={fileInput} className="attachment-input" type="file" multiple tabIndex={-1} aria-hidden="true" onChange={(event) => { attachFiles(Array.from(event.target.files ?? [])); event.target.value = ""; }} />{attachments.length > 0 && <div className="composer-attachments" aria-label="Prompt attachments">{attachments.map((attachment) => <div key={attachment.id} className={`composer-attachment ${attachment.status}`}><span className="attachment-glyph" aria-hidden="true"><svg viewBox="0 0 16 16"><path d="M4 2.5h5l3 3v8H4zM9 2.5v3h3" /></svg></span><span className="attachment-copy"><strong title={attachment.file.name}>{attachment.file.name}</strong><small>{attachment.status === "uploading" ? `Uploading ${Math.round(attachment.progress * 100)}%` : attachment.status === "failed" ? attachment.error : `${Math.ceil((attachment.reference?.sizeBytes ?? attachment.file.size) / 1024)} KB · Ready`}</small></span>{attachment.status === "failed" && <button type="button" onClick={() => void uploadAttachment(attachment)}>Retry</button>}<button type="button" aria-label={attachment.status === "uploading" ? `Cancel upload ${attachment.file.name}` : `Remove ${attachment.file.name}`} onClick={() => removeAttachment(attachment.id)}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8" /></svg></button></div>)}</div>}{orderedPendingInputs.length > 0 && <div className="pending-inputs" role="status" aria-label="Pending prompt delivery">{orderedPendingInputs.map((pending) => <div key={pending.id}><strong>{pending.mode === "steer" ? "Steering" : pending.mode === "follow_up" ? "Follow-up" : "Interrupting"}</strong><span>{pending.text}</span></div>)}</div>}<textarea ref={composer} value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (slashCommands.length > 0 && (event.key === "ArrowDown" || event.key === "ArrowUp")) { event.preventDefault(); setSlashCommandIndex((current) => (current + (event.key === "ArrowDown" ? 1 : -1) + slashCommands.length) % slashCommands.length); } else if (slashCommands.length > 0 && (event.key === "Tab" || (event.key === "Enter" && !event.shiftKey))) { event.preventDefault(); selectCommand(slashCommands[slashCommandIndex] as EffectiveCommand); } else if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(promptDeliveryShortcut(event)); } }} placeholder="Ask Axl…" aria-label="Message" aria-keyshortcuts="Enter Alt+Enter Control+Enter Meta+Enter Shift+Tab" aria-expanded={slashCommands.length > 0} rows={3} disabled={busy} /><div className="composer-footer"><button type="button" className="attach-button" aria-label="Attach files" title={canUpload ? "Attach files" : "Unavailable because attachment upload was not granted"} disabled={!canUpload || busy || !connected} onClick={() => fileInput.current?.click()}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m6 8.5 4.2-4.2a2.1 2.1 0 0 1 3 3l-5.5 5.5a3.5 3.5 0 0 1-5-5l5.4-5.4" /></svg></button>{canShell && <button type="button" className="shell-button" aria-label="Run shell command" title="Run shell command (! includes output, !! excludes it)" disabled={busy || !connected} onClick={() => { setDraft((current) => current || "! "); queueMicrotask(() => composer.current?.focus()); }}>&gt;_</button>}<span className="delivery-hint" title="Ctrl/Cmd+Enter interrupts and delivers."><span><kbd>Enter</kbd>{deliveryActive ? "Steer" : "Send"}</span><span><kbd>Alt Enter</kbd>Follow up</span></span>{pendingDeliveries > 0 && <span className="delivery-status" role="status">Delivering {pendingDeliveries}</span>}{profileSupportsWebTools(conversation.profile ?? opened.profile) && <WebToolControls compact webSearch={conversation.webSearch} webFetch={conversation.webFetch} pending={webToolPending} errors={presentedWebToolErrors} disabled={!canConfigure || busy || conversation.activeOperationId !== undefined || !connected} {...(unavailableConfigurationError === undefined ? {} : { unavailableReason: unavailableConfigurationError })} onChange={(field, value) => { if (value !== undefined) void configureWebTool(field, value); }} />}<ModelPicker choices={modelCatalog} provider={conversation.provider} model={conversation.model} thinking={conversation.thinking} openRequest={modelPickerOpenRequest} initialFocus={modelPickerInitialFocus} disabled={!canConfigure || busy || configurationPending || (preview === undefined && conversation.activeOperationId !== undefined) || !connected} {...(unavailableConfigurationError === undefined ? {} : { unavailableReason: unavailableConfigurationError })} {...(presentedModelConfigurationError === undefined ? {} : { error: presentedModelConfigurationError })} onModel={(choice) => void configureModel(choice)} onThinking={(level) => void configureThinking(level)} />{conversation.activeOperationId && directOperation === undefined && <button type="button" className="composer-submit stop" aria-label="Stop response" onClick={() => void interrupt()} title={canInterrupt ? undefined : "Unavailable because session interruption was not granted"} disabled={!connected || !canInterrupt}><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="3.75" y="3.75" width="8.5" height="8.5" rx="1.25" /></svg></button>}<button className="composer-submit send" aria-label={deliveryActive ? "Deliver during active response" : "Send message"} title={canDeliver ? undefined : `Unavailable because ${deliveryActive ? "steering" : "prompt delivery"} was not granted`} disabled={!canDeliver || (!draft.trim() && readyAttachmentCount === 0) || attachmentUploading || busy || !connected}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M14 2 8.5 14 6.4 9.6 2 7.5 14 2Z M6.4 9.6 10 6" /></svg></button></div></form>}
+      {opened && <form className="composer" ref={composerForm} onSubmit={(event) => { event.preventDefault(); if (canDeliver) void send(); }}>{mascotOn && <Mascot colour={mascotColour} draft={draft} control={mascotControl} onError={failMascot} />}{slashCommands.length > 0 && <div id="slash-command-list" className="slash-commands" role="listbox" aria-label="Slash commands">{slashCommands.map((command) => <button key={command.id} id={`slash-command-${command.id}`} type="button" role="option" aria-selected={command === slashCommands[slashCommandIndex]} disabled={command.availability.state === "unavailable"} onClick={() => selectCommand(command)}><strong>/{command.name}</strong><span>{command.availability.state === "unavailable" ? command.availability.reason : command.description}</span></button>)}</div>}<input ref={fileInput} className="attachment-input" type="file" multiple tabIndex={-1} aria-hidden="true" onChange={(event) => { attachFiles(Array.from(event.target.files ?? [])); event.target.value = ""; }} />{attachments.length > 0 && <div className="composer-attachments" aria-label="Prompt attachments">{attachments.map((attachment) => <div key={attachment.id} className={`composer-attachment ${attachment.status}`}><span className="attachment-glyph" aria-hidden="true"><svg viewBox="0 0 16 16"><path d="M4 2.5h5l3 3v8H4zM9 2.5v3h3" /></svg></span><span className="attachment-copy"><strong title={attachment.file.name}>{attachment.file.name}</strong><small>{attachment.status === "uploading" ? `Uploading ${Math.round(attachment.progress * 100)}%` : attachment.status === "failed" ? attachment.error : `${Math.ceil((attachment.reference?.sizeBytes ?? attachment.file.size) / 1024)} KB · Ready`}</small></span>{attachment.status === "failed" && <button type="button" onClick={() => void uploadAttachment(attachment)}>Retry</button>}<button type="button" aria-label={attachment.status === "uploading" ? `Cancel upload ${attachment.file.name}` : `Remove ${attachment.file.name}`} onClick={() => removeAttachment(attachment.id)}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8" /></svg></button></div>)}</div>}{orderedPendingInputs.length > 0 && <div className="pending-inputs" role="status" aria-label="Pending prompt delivery">{orderedPendingInputs.map((pending) => <div key={pending.id}><strong>{pending.mode === "steer" ? "Steering" : pending.mode === "follow_up" ? "Follow-up" : "Interrupting"}</strong><span>{pending.text}</span></div>)}</div>}<textarea ref={composer} value={draft} onChange={(event) => { mascotControl.current?.director.keystroke(Date.now()); setDraft(event.target.value); }} onKeyDown={(event) => { if (slashCommands.length > 0 && (event.key === "ArrowDown" || event.key === "ArrowUp")) { event.preventDefault(); setSlashCommandIndex((current) => nextSelectableSlashIndex(slashCommands, current, event.key === "ArrowDown" ? 1 : -1)); } else if (slashCommands.length > 0 && (event.key === "Tab" || (event.key === "Enter" && !event.shiftKey))) { const chosen = selectableSlashCommand(slashCommands, slashCommandIndex); if (chosen !== undefined) { event.preventDefault(); selectCommand(chosen); } else if (event.key === "Enter") { event.preventDefault(); void send(promptDeliveryShortcut(event)); } } else if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(promptDeliveryShortcut(event)); } }} placeholder="Ask Axl…" aria-label="Message" role="combobox" aria-controls="slash-command-list" aria-haspopup="listbox" aria-autocomplete="list" {...(slashCommands.length > 0 ? { "aria-activedescendant": `slash-command-${slashCommands[slashCommandIndex]?.id}` } : {})} aria-keyshortcuts="Enter Alt+Enter Control+Enter Meta+Enter Shift+Tab" aria-expanded={slashCommands.length > 0} rows={3} disabled={composerBusy} /><div className="composer-footer"><button type="button" className="attach-button" aria-label="Attach files" title={canUpload ? "Attach files" : "Unavailable because attachment upload was not granted"} disabled={!canUpload || composerBusy || !connected} onClick={() => fileInput.current?.click()}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m6 8.5 4.2-4.2a2.1 2.1 0 0 1 3 3l-5.5 5.5a3.5 3.5 0 0 1-5-5l5.4-5.4" /></svg></button><span className="composer-spacer" />{pendingDeliveries > 0 && <span className="delivery-status" role="status">Delivering {pendingDeliveries}</span>}<ModelPicker choices={modelCatalog} provider={conversation.provider} model={conversation.model} thinking={conversation.thinking} openRequest={modelPickerOpenRequest} initialFocus={modelPickerInitialFocus} disabled={!canConfigure || composerBusy || configurationPending || (preview === undefined && conversation.activeOperationId !== undefined) || !connected} {...(unavailableConfigurationError === undefined ? {} : { unavailableReason: unavailableConfigurationError })} {...(presentedModelConfigurationError === undefined ? {} : { error: presentedModelConfigurationError })} onModel={(choice) => void configureModel(choice)} onThinking={(level) => void configureThinking(level)} />{conversation.activeOperationId && directOperation === undefined && <button type="button" className="composer-submit stop" aria-label="Stop response" onClick={() => void interrupt()} title={canInterrupt ? undefined : "Unavailable because session interruption was not granted"} disabled={!connected || !canInterrupt}><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="3.75" y="3.75" width="8.5" height="8.5" rx="1.25" /></svg></button>}<button className="composer-submit send" aria-label={deliveryActive ? "Deliver during active response" : "Send message"} title={canDeliver ? undefined : `Unavailable because ${deliveryActive ? "steering" : "prompt delivery"} was not granted`} disabled={!canDeliver || (!draft.trim() && readyAttachmentCount === 0) || attachmentUploading || composerBusy || !connected}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M14 2 8.5 14 6.4 9.6 2 7.5 14 2Z M6.4 9.6 10 6" /></svg></button></div></form>}
     </section>
     <div id="pane-dock" ref={mobileDockPanel} className={`dock-column${dockOpen ? " open" : ""}`} aria-hidden={!dockOpen} aria-label={mobileDock ? "Open panes" : undefined} role={mobileDock ? "dialog" : undefined} aria-modal={mobileDock || undefined} inert={sidebarOpen} onKeyDown={(event) => { if (mobileDock) trapDialogFocus(event, mobileDockPanel.current); }}>
       <button ref={mobileDockClose} type="button" className="mobile-dock-close" onClick={() => setMobileDock(false)}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m10 3-5 5 5 5" /></svg>Conversation</button>
       {dockOpen && <div className="panel-resizer right" role="separator" aria-orientation="vertical" aria-label="Resize pane dock" aria-valuemin={DOCK_WIDTH_RANGE.min} aria-valuemax={DOCK_WIDTH_RANGE.max} aria-valuenow={dockWidth} aria-valuetext={`${dockWidth} pixels wide`} aria-keyshortcuts="ArrowLeft ArrowRight" tabIndex={0} onPointerDown={(event) => resizePanel("right", event)} onKeyDown={(event) => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); resizePanelBy("right", event.key === "ArrowLeft" ? 16 : -16); } }} />}
       <Dock
+        tabbed={compactDock || frameSize.height <= 720}
         layout={paneLayout}
         onLayout={applyPaneLayout}
         renderControls={(pane) => pane === "files"
@@ -2208,7 +2709,7 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
                 : <div className="pane-empty"><strong>No session</strong><span>Open a session to browse its workspace.</span></div>;
             case "changes":
               return opened
-                ? <WorkspaceChanges review={workspaceReview} loading={reviewLoading} error={reviewError} view={changesView} scope={workspaceScope} canCheckpoint={canCheckpointWorkspace} checkpointEnabled={workspaceCheckpointEnabled} checkpointDisabled={busy || conversation.activeOperationId !== undefined} onScope={(scope) => void loadWorkspaceChanges(scope)} onCheckpoint={(enabled) => void configureWorkspaceCheckpoint(enabled)} onViewChange={(view) => { setChangesView(view); persistLayout({ ...currentPreferences(), changesView: view }); }} onRetry={refreshWorkspaceChanges} onMentionPath={mentionPath} onOpenInFiles={openInFiles} changesSplit={changesSplit} onChangesSplit={setChangesSplit} />
+                ? <WorkspaceChanges review={workspaceReview} loading={reviewLoading} error={reviewError} view={changesView} scope={workspaceScope} canCheckpoint={canCheckpointWorkspace} checkpointEnabled={workspaceCheckpointEnabled} checkpointDisabled={composerBusy || conversation.activeOperationId !== undefined} onScope={(scope) => void loadWorkspaceChanges(scope)} onCheckpoint={(enabled) => void configureWorkspaceCheckpoint(enabled)} onViewChange={(view) => { setChangesView(view); persistLayout({ ...currentPreferences(), changesView: view }); }} onRetry={refreshWorkspaceChanges} onMentionPath={mentionPath} onOpenInFiles={openInFiles} changesSplit={changesSplit} onChangesSplit={setChangesSplit} />
                 : <div className="pane-empty"><strong>No session</strong><span>Open a session to review its changes.</span></div>;
             case "terminal":
               return <TerminalPane entries={terminalRecords} running={directOperation?.kind === "shell" && directOperation.source === "terminal" && directOperation.command !== undefined ? { command: directOperation.command, cancelling: directOperation.cancelling } : undefined} error={terminalError} disabled={!canShell || !connected || opened === undefined} cwd={opened?.cwd ?? bootstrap?.cwd ?? ""} onRun={(command, excluded) => void runTerminalCommand(command, excluded)} onCancel={() => void cancelDirectOperation()} />;
@@ -2218,14 +2719,14 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
         }}
       />
     </div>
-    {controlCenter && <Suspense fallback={null}><ControlCenter tab={controlCenter} preferences={currentPreferences()} theme={theme} providers={providerInventory} providerLoading={providerLoading} providerRefresh={providerDirectory.refresh} providerError={providerError} providerLogin={providerLogin} settingsError={settingsError} canRefresh={hasCapability("provider.catalog.refresh")} canLogin={canLoginProvider} canLogout={hasCapability("provider.auth.logout")} onTab={setControlCenter} onPreferences={applyWebPreferences} onTheme={(nextTheme) => { setSettingsError(undefined); setTheme(nextTheme); }} onRefresh={(providerId) => void refreshProviders(providerId)} onCancelRefresh={() => providerDirectoryController.current?.cancelRefresh()} onLogin={(providerId, method) => void startProviderLogin(providerId, method)} onCancelLogin={cancelProviderLogin} onLogout={(providerId) => void logoutProvider(providerId)} onCopyLogin={(providerId, method) => void copyProviderLogin(providerId, method)} onClose={() => { setControlCenter(undefined); setSettingsError(undefined); }} /></Suspense>}
-    {sessionLifecycleOpen && selectedSummary && <SessionLifecycle session={selectedSummary} busy={busy} capabilities={lifecycleCapabilities} {...(sessionLifecycleError === undefined ? {} : { error: sessionLifecycleError })} onRename={(title) => void renameSession(title)} onClone={() => void cloneSession()} onExport={() => void exportArtifact()} onDispose={() => void disposeSession()} onDelete={() => void deleteSession()} onClose={() => { setSessionLifecycleOpen(false); setSessionLifecycleError(undefined); }} />}
+    {controlCenter && <Suspense fallback={null}><ControlCenter tab={controlCenter} webTools={opened !== undefined && profileSupportsWebTools(conversation.profile ?? opened.profile) ? <WebToolControls webSearch={conversation.webSearch} webFetch={conversation.webFetch} pending={webToolPending} errors={presentedWebToolErrors} disabled={!canConfigure || composerBusy || conversation.activeOperationId !== undefined || !connected} {...(unavailableConfigurationError === undefined ? {} : { unavailableReason: unavailableConfigurationError })} onChange={(field, value) => { if (value !== undefined) void configureWebTool(field, value); }} /> : undefined} preferences={currentPreferences()} theme={theme} providers={providerInventory} providerLoading={providerLoading} providerRefresh={providerDirectory.refresh} providerError={providerError} providerLogin={providerLogin} settingsError={settingsError} mcp={mcpConfiguration} mcpError={mcpError} mcpBusy={mcpBusy} mcpActiveIdentities={mcpActiveIdentities} canRefresh={hasCapability("provider.catalog.refresh")} canLogin={canLoginProvider} canLogout={hasCapability("provider.auth.logout")} onTab={(tab) => { setControlCenter(tab); if (tab === "mcp") void loadMcpConfiguration(); }} onPreferences={applyWebPreferences} onTheme={(nextTheme) => { setSettingsError(undefined); setTheme(nextTheme); persistLayout({ ...currentPreferences(), theme: nextTheme }); }} onRefresh={(providerId) => void refreshProviders(providerId)} onCancelRefresh={() => providerDirectoryController.current?.cancelRefresh()} onLogin={(providerId, method) => void startProviderLogin(providerId, method)} onCancelLogin={cancelProviderLogin} onLogout={(providerId) => void logoutProvider(providerId)} onCopyLogin={(providerId, method) => void copyProviderLogin(providerId, method)} onMcpAdd={addMcpServer} onMcpImport={importMcpServers} onMcpRemove={(name) => void removeMcpServer(name)} onMcpSetEnabled={(name, enabled) => void setMcpServerEnabled(name, enabled)} onMcpReload={() => void mutateMcpServer("MCP servers reloaded", () => Promise.resolve())} onClose={() => { setControlCenter(undefined); setSettingsError(undefined); setMcpError(undefined); }} /></Suspense>}
+    {sessionLifecycleOpen && selectedSummary && <SessionLifecycle session={selectedSummary} busy={lifecycleBusy} capabilities={lifecycleCapabilities} {...(sessionLifecycleError === undefined ? {} : { error: sessionLifecycleError })} onRename={(title) => void renameSession(title)} onClone={() => void cloneSession()} onExport={() => void exportArtifact()} onDispose={() => void disposeSession()} onDelete={() => void deleteSession()} onClose={() => { setSessionLifecycleOpen(false); setSessionLifecycleError(undefined); }} />}
     {requeueOpen && <RequeueDialog items={pausedQueue} busyItemId={requeueBusyItemId} error={requeueError} onRequeue={(queueItemId) => void requeueItem(queueItemId)} onClose={() => { setRequeueOpen(false); setRequeueError(undefined); }} />}
     {newSessionOpen && <NewSessionDialog
       draft={newSessionDraft}
       models={modelCatalog}
       modelPickerOpenRequest={newSessionModelPickerOpenRequest}
-      busy={busy}
+      busy={lifecycleBusy}
       projectFolders={projectFolders}
       {...(newSessionError === undefined ? {} : { error: newSessionError })}
       {...(canCreate ? {} : { unavailableReason: "Session creation was not granted" })}
@@ -2237,5 +2738,24 @@ export function AxlApp({ preview }: { readonly preview?: WebPreview } = {}): Rea
         setNewSessionError(undefined);
       }}
     />}
-  </main>;
+  </main>
+    </div>
+    {showLounge && <LoungePane storage={browserLoungeStorage} settings={loungeSettings} onSettings={updateLoungeSettings} onClose={() => toggleLounge(false)} />}
+  </div>;
+}
+
+function AuthRequired(): React.JSX.Element {
+  return (
+    <main className="auth-required">
+      <h1>This browser is not signed in</h1>
+      <p>
+        Axl web links work once and expire after 60 seconds, so a copied address cannot sign in a
+        second browser.
+      </p>
+      <p>
+        In the terminal running <code>axl web</code>, press Enter to print a new link, or run{" "}
+        <code>axl web --no-open --print-url</code>. Then open the link in this browser.
+      </p>
+    </main>
+  );
 }

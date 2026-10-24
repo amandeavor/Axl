@@ -16,6 +16,7 @@ import { DEFAULT_MODEL_REQUEST_SETTINGS } from "@axl/protocol";
 import { fitModelRequest } from "./request-configuration.ts";
 
 import type { ModelProvider } from "./provider.ts";
+import { type ProviderHttpHooks, runWithProviderHooks } from "./provider-hooks.ts";
 import type { RequestModelMessage } from "./model.ts";
 import type { ProviderRegistry } from "./registry.ts";
 import { prepareModelRequest } from "./request-preparation.ts";
@@ -29,6 +30,7 @@ export interface SessionPortOptions {
   readonly maxOutputTokens?: number;
   readonly requestSettings?: ModelRequestSettings;
   readonly readBlob?: (reference: BlobReference) => Promise<Uint8Array>;
+  readonly providerHooks?: ProviderHttpHooks;
 }
 
 interface PortTurnRequest {
@@ -36,6 +38,7 @@ interface PortTurnRequest {
   readonly messages: readonly ModelMessage[];
   readonly tools: readonly ToolDeclaration[];
   readonly maxOutputTokens?: number | undefined;
+  readonly cacheRetention?: "none" | "short" | "long" | undefined;
   readonly toolChoice?: "auto" | "required" | "none" | undefined;
   readonly signal?: AbortSignal | undefined;
   readonly estimatedInputTokens?: number | undefined;
@@ -65,6 +68,9 @@ async function configureRequest(
     tools: request.tools,
     ...(options.thinkingLevel === undefined ? {} : { thinkingLevel: options.thinkingLevel }),
     ...(requestedMaximum === undefined ? {} : { maxOutputTokens: requestedMaximum }),
+    ...(request.cacheRetention === undefined
+      ? {}
+      : { cache: { retention: request.cacheRetention } as const }),
     httpIdleTimeoutMs: settings.httpIdleTimeoutMs,
     ...(request.estimatedInputTokens === undefined
       ? {}
@@ -214,6 +220,27 @@ function retainReplayMetadata(
   });
 }
 
+function streamWithHooks(
+  create: () => AsyncIterable<ModelStreamEvent>,
+  hooks: ProviderHttpHooks | undefined,
+): AsyncIterable<ModelStreamEvent> {
+  return (async function* () {
+    const iterator = await runWithProviderHooks(hooks, async () =>
+      create()[Symbol.asyncIterator](),
+    );
+    try {
+      for (;;) {
+        const result = await runWithProviderHooks(hooks, () => iterator.next());
+        if (result.done) return;
+        yield result.value;
+      }
+    } finally {
+      const close = iterator.return;
+      if (close !== undefined) await runWithProviderHooks(hooks, () => close.call(iterator));
+    }
+  })();
+}
+
 function streamWithSecretSink(
   stream: AsyncIterable<ModelStreamEvent>,
   sink: ((values: readonly string[]) => void) | undefined,
@@ -272,7 +299,10 @@ export function modelPortForSession(
             const messages = retainReplayMetadata(request.messages, replayTurns);
             const prepared = await configureRequest(model, request, options, messages);
             request.signal?.throwIfAborted();
-            yield* streamWithSecretSink(provider.stream(prepared), options.onResolvedSecrets);
+            yield* streamWithSecretSink(
+              streamWithHooks(() => provider.stream(prepared), options.providerHooks),
+              options.onResolvedSecrets,
+            );
           })(),
           request.signal,
         ),
@@ -302,7 +332,10 @@ export function modelPortForRegistry(
             const configured = await configureRequest(model, request, options, messages);
             request.signal?.throwIfAborted();
             yield* streamWithSecretSink(
-              registry.stream(options.providerId, configured),
+              streamWithHooks(
+                () => registry.stream(options.providerId, configured),
+                options.providerHooks,
+              ),
               options.onResolvedSecrets,
             );
           })(),

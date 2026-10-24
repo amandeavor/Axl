@@ -10,11 +10,13 @@ import {
   type CommandListResult,
   mergeCommandDirectory,
   parseEventId,
+  parseOperationId,
   parseSessionId,
 } from "../src/index.ts";
 
 const sessionId = parseSessionId("00000000-0000-4000-8000-000000000001");
 const queueItemId = parseEventId("00000000-0000-4000-8000-000000000002");
+const operationId = parseOperationId("00000000-0000-4000-8000-000000000003");
 const catalog: CommandListResult = {
   generation: "builtin-1",
   commands: [
@@ -56,6 +58,16 @@ const catalog: CommandListResult = {
       context: "global",
       argument: { required: false, hint: "provider" },
       requiredCapabilities: ["provider.auth.logout"],
+      availability: { state: "available" },
+    },
+    {
+      id: "core.mcp",
+      name: "mcp",
+      aliases: [],
+      description: "Configure MCP servers",
+      context: "global",
+      argument: { required: false, hint: "server" },
+      requiredCapabilities: ["mcp.config.list", "mcp.config.upsert", "mcp.config.remove"],
       availability: { state: "available" },
     },
     {
@@ -142,6 +154,9 @@ test("command controller loads, searches, and invokes typed operations", async (
     request: async (method: string, params: unknown) => {
       requests.push({ method, params });
       if (method === "command.list") return catalog;
+      if (method === "session.compact") {
+        return { state: "queued", operationId, eventId: queueItemId };
+      }
       return method === "session.reload" ? { boundaryEventIds: [] } : {};
     },
     refreshProviderCatalogs: async (params: unknown) => {
@@ -191,6 +206,10 @@ test("command controller loads, searches, and invokes typed operations", async (
     surface: "login",
     argument: "azure",
   });
+  assert.deepEqual(await commands.invoke("/mcp", sessionId), {
+    state: "focus",
+    surface: "mcp",
+  });
   assert.deepEqual(
     await commands.invoke("/request output 2048", sessionId, {
       requestSettings: { maxOutputTokens: null, httpIdleTimeoutMs: 30_000 },
@@ -202,7 +221,7 @@ test("command controller loads, searches, and invokes typed operations", async (
     },
   );
   assert.deepEqual(await commands.invoke("/compact keep decisions", sessionId), {
-    state: "completed",
+    state: "queued",
     command: "compact",
   });
   assert.deepEqual(await commands.invoke("/rename Focused work", sessionId), {
@@ -249,6 +268,79 @@ test("command controller loads, searches, and invokes typed operations", async (
   ]);
 });
 
+test("extension diagnostics command uses the public SDK", async () => {
+  const client = {
+    request: async (method: string) => {
+      if (method === "command.list") {
+        return {
+          generation: "extensions",
+          commands: [
+            {
+              id: "extension:axl-core/extensions",
+              name: "extensions",
+              aliases: [],
+              description: "List extensions",
+              context: "session",
+              argument: { required: false },
+              requiredCapabilities: ["extension.command.invoke"],
+              availability: { state: "available" },
+              extensionId: "axl-core",
+            },
+          ],
+        };
+      }
+      throw new Error(`unexpected ${method}`);
+    },
+    invokeExtensionCommand: async () => ({ content: "enabled broken (global): activation failed" }),
+  } as unknown as AxlClient;
+  const commands = new CommandController(client);
+  await commands.refresh(sessionId);
+  assert.deepEqual(await commands.invoke("/extensions", sessionId), {
+    state: "completed",
+    command: "extensions",
+    content: "enabled broken (global): activation failed",
+  });
+});
+
+test("command controller invokes shared extension commands through typed RPC", async () => {
+  const requests: unknown[] = [];
+  const client = {
+    request: async (method: string) => {
+      if (method === "command.list") {
+        return {
+          generation: "extensions",
+          commands: [
+            {
+              id: "extension:example/hello",
+              name: "hello",
+              aliases: [],
+              description: "Say hello",
+              context: "session",
+              argument: { required: false, hint: "name" },
+              requiredCapabilities: ["extension.command.invoke"],
+              availability: { state: "available" },
+              extensionId: "example",
+            },
+          ],
+        };
+      }
+      throw new Error(`unexpected ${method}`);
+    },
+    invokeExtensionCommand: async (params: unknown) => {
+      requests.push(params);
+      return { content: "hello" };
+    },
+  } as unknown as AxlClient;
+  const commands = new CommandController(client);
+  await commands.refresh(sessionId);
+  assert.deepEqual(await commands.invoke("/hello world", sessionId), {
+    state: "completed",
+    command: "hello",
+    content: "hello",
+  });
+  assert.deepEqual(requests, [{ sessionId, name: "hello", args: { argument: "world" } }]);
+});
+
 test("command invocation rejects malformed names without ambiguous parsing", async () => {
   const commands = new CommandController({} as AxlClient);
   for (const input of ["/reload\nagain", "/bad--name", "/bad-", "/9bad", "/"]) {
@@ -272,6 +364,7 @@ test("command directory sorts daemon and presentation commands by name", () => {
       "import",
       "login",
       "logout",
+      "mcp",
       "refresh",
       "reload",
       "rename",

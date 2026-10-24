@@ -15,7 +15,15 @@ import { highlightCode, languageForPath } from "./highlight.ts";
 import { sanitizeTerminalText, truncateToWidth, visibleWidth, wrapLine } from "./render.ts";
 import type { Palette, ToolOutputDisplay } from "./transcript.ts";
 
-const HIDDEN_RESULT_TOOLS = new Set(["read", "grep", "find", "ls", "edit", "write", "skill"]);
+const HIDDEN_RESULT_TOOLS = new Set([
+  "read",
+  "grep",
+  "find",
+  "ls",
+  "edit",
+  "write",
+  "capability_search",
+]);
 const COMPACT_PREVIEW_LINES = 6;
 const BASH_PREVIEW_LINES = 6;
 const FULL_RESULT_LINES = 200;
@@ -442,11 +450,6 @@ function transactionTarget(name: string, input: Record<string, unknown>): string
   }
   if (name === "grep") return `/${field(input, "pattern") ?? ""}/ · ${pathLabel(input)}`;
   if (name === "find") return `${field(input, "pattern") ?? ""} · ${pathLabel(input)}`;
-  if (name === "mcp") {
-    return [field(input, "server"), field(input, "name") ?? field(input, "action")]
-      .filter(Boolean)
-      .join(" · ");
-  }
   if (name === "skill") {
     const action = field(input, "action") ?? "load";
     const target = field(input, "name") ?? field(input, "path") ?? "";
@@ -616,7 +619,7 @@ export function renderToolTransaction(input: {
     input.mode === "focus" &&
     input.status === "succeeded" &&
     (custom?.hideWhenSuccessfulInFocus ??
-      ["read", "grep", "find", "ls", "mcp", "skill"].includes(input.name))
+      ["read", "grep", "find", "ls", "skill"].includes(input.name))
   )
     return [];
   const target = previewText(
@@ -713,5 +716,5 @@ export function renderShellPassthrough(input: {
 }
 
 function isMcpTool(name: string): boolean {
-  return name === "mcp" || name.startsWith("mcp_") || name.includes("__mcp__");
+  return name.startsWith("mcp_") || name.includes("__mcp__");
 }

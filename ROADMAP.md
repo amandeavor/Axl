@@ -3,6 +3,7 @@
 <!-- SPDX-FileCopyrightText: 2026 Lokesh -->
 <!-- SPDX-FileCopyrightText: 2026 Srihari -->
 <!-- SPDX-FileCopyrightText: 2026 VishnuM449 -->
+<!-- SPDX-FileCopyrightText: 2026 Shaan Narendran -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
 # Axl roadmap
@@ -117,7 +118,7 @@ Every shipped feature outside the kernel is a native extension that can be enabl
 - A disabled feature contributes no prompt tokens, UI, or background work.
 - The kernel (section 2.3) is not a plugin. DSH allows its model adapter, session log, and agent loop to be replaced, but Axl keeps them fixed for these reasons:
   - **The guarantees live there.** One fixed event log supports log authority, append-only cache behavior, tool call/result integrity, and deterministic replay. A replaceable log would make those guarantees installation-specific.
-  - **Security sits below extensions.** Permissions and sandbox enforcement cannot be plugins because plugins must not replace their own security boundary.
+  - **Security for model-selected built-ins sits below extensions.** Permissions and sandbox enforcement cannot be plugins because plugins must not replace those boundaries. Installed in-process extension code is trusted host code and is not confined by the model tool sandbox.
   - **Everything meets at the kernel.** Clients, SDKs, the viewer, insights, imports, and compaction depend on one event format and one loop.
   - **Axl is a product, not a framework kit.** A replaceable core would burden users with more combinations, harder debugging, and setup choices.
 
@@ -419,15 +420,19 @@ The public extension API is capability-scoped and grows only from working consum
 
 The implemented client-local terminal presentation surface supports commands and completion, shortcuts, status and working labels, bounded widgets, lifecycle listeners, tool renderers, and tracked cleanup. It cannot mutate canonical session state or access daemon and kernel internals. MCP and Agent Skills currently use its public tool-renderer registration.
 
-The daemon/runtime surface begins in Phase 6 with operations that have runtime consumers:
+The daemon extension surface is implemented in `@axl/extension-api` and hosted by `@axl/extension-host`. A daemon extension is a `.ts` or `.js` module in `~/.axl/extensions/` whose default export receives the API. It runs inside the daemon process:
 
 ```text
-registerTool
-registerSkill
-on
+registerTool          model-discoverable tool, indexed through capability_search
+on("tool.call")       block a tool call before it runs; a thrown error also blocks
+on("command")         replace the inputs of, or refuse, any built-in command
+on("session.event")   observe every durable canonical event
+track                 cleanup that runs when the session ends
 ```
 
-Every registration returns a disposer. Extensions declare capabilities before activation. Shared-state commands use typed daemon RPC, while presentation-only commands stay in the terminal API. `registerProvider`, `registerHook`, `registerTheme`, broader renderers, and `registerWebPanel` are added only when their first implementation needs them.
+`registerSkill` follows when its first consumer needs it.
+
+Every registration returns a disposer. An invalid extension fails session start with the file path and reason; nothing is skipped silently. Extension tools stay out of the stable prompt until the model activates them. Shared-state commands use typed daemon RPC, while presentation-only commands stay in the terminal API. `registerProvider`, `registerHook`, `registerTheme`, broader renderers, and `registerWebPanel` are added only when their first implementation needs them.
 
 Example manifest:
 
@@ -470,7 +475,7 @@ Axl implements established agent standards directly:
 
 A standard qualifies when it is open and used by more than one vendor. Its current steward does not affect Axl's implementation. The same rule applies outside agent tooling: Axl uses OCI specifications for containers and `devcontainer.json` for repository environments (section 11).
 
-The adoption compiler handles proprietary or divergent formats (section 4). Resources that already use supported standards install without conversion. They still pass the normal trust checks, including capability declarations, installation approval, and extension isolation (section 10.4). Standards compliance does not make executable code safe.
+The adoption compiler handles proprietary or divergent formats (section 4). Resources that already use supported standards install without conversion. They still pass the normal trust checks, including capability declarations, installation approval, and extension trust (section 10.4). Standards compliance does not make executable code safe.
 
 ### 6. Subagents
 
@@ -606,7 +611,7 @@ Rules:
 - Dynamic information should leave the stable prompt prefix unchanged. The user request and other per-turn content follow that prefix.
 - If a capability is unavailable for a request, it contributes zero prompt tokens.
 
-Provider caches match the longest unchanged prefix, so Axl appends new context instead of rewriting old content. The base prompt and core tool schemas stay stable. Skills, context, and injected instructions arrive after the user message. BM25-selected tool schemas may change at a user-turn boundary, then remain frozen through every continuation in that turn. Correct tool selection takes priority over retaining every possible cache hit.
+Provider caches match the longest unchanged prefix, so Axl appends new context instead of rewriting old content. The base prompt and core tool schemas stay stable. Skills, context, and injected instructions arrive after that prefix. BM25-selected tool schemas are added when activated and remain in the session roster. Correct tool selection takes priority over retaining every possible cache hit.
 
 #### 7.2 Global AGENTS.md
 
@@ -646,7 +651,7 @@ Tool identity is canonical, but provider adapters render each selected tool in t
 
 Axl distinguishes four directions of invocation:
 
-- **Model to harness:** typed tools selected for the current turn
+- **Model to harness:** typed tools selected progressively for the session
 - **User to harness:** commands such as `/goal`, `/slow`, `/btw`, `/subagents`, `/learn`, `/adopt`, and `/insights`
 - **Harness to model:** roles such as compaction, facet extraction, and vision description
 - **Internal work:** hooks, learning records, tips, and reconciliation
@@ -655,13 +660,13 @@ A scoped harness-control tool may expose user commands to the model when request
 
 #### 7.5 Progressive capability disclosure
 
-Axl maintains one disposable local BM25 index for enabled skills, tools, commands, and agent definitions. Each record contains a name, kind, description, aliases, path, and scope. The index is rebuilt from manifests and frontmatter and is never authoritative.
+Axl maintains a disposable local BM25 index for authorized optional capabilities. Agent Skills are the first indexed kind; tools, commands, and agent definitions join when their runtime paths exist. Each normalized record contains a stable identity, kind, name, description, aliases, canonical path, scope, provenance, enabled state, trust state, availability, and required authority. The index is rebuilt from validated metadata and is never authoritative.
 
-Before the first model request for each user turn, Axl searches the index using the user's text. Exact names and aliases rank first, project entries win ties against global entries, and results below a fixed relevance threshold are discarded. At most three matches are disclosed, and the event log records what was selected.
+The stable `capability_search` tool supports explicit `search`, `activate`, and active-capability `read` actions. Exact names and aliases rank first, deterministic BM25 ranks remaining lexical matches, project entries win equivalent scores, and stable identity breaks the final tie. Zero-score records are omitted. Limits are bounded per call, with no fixed session activation ceiling.
 
-Skills, commands, and agent definitions contribute only compact metadata and a path. The model uses the normal read tool to load a full body when needed. An explicit request such as `/skill:pull-request` skips ranking and loads that item directly.
+Search returns only compact metadata and paths. Activation rechecks identity, trust, policy, authority, availability, and containment before loading full instructions. Activated capabilities are additive and remain active for the rest of the session, including after restart. Referenced Skill files are read through the same capability tool only while that Skill is active, so host paths do not need to enter the workspace sandbox. Search, activation, denial, and exact model-visible content are canonical events. An explicit request such as `/skill:pull-request` may later skip ranking and load that item directly.
 
-A selected executable tool contributes its complete provider-native schema before inference. The model calls it directly by its rendered name. Axl freezes the selected roster and implementation bindings through every continuation in that turn, then may select a new roster for the next user turn. Dispatch validates tool input against the frozen schema.
+A selected executable tool contributes its complete provider-native schema before inference. The model calls it directly by its rendered name. Axl adds the selected tool to the session roster and preserves its implementation binding for the rest of the session. Dispatch validates tool input against the frozen schema.
 
 The stable prompt says only that optional capabilities may be supplied with a request. Axl does not preload the catalog, depend on provider-native `tool_search`, use embeddings, maintain a vector index, or route normal calls through a generic untyped tool. Discovery never grants authority, and disabled, unavailable, or untrusted capabilities are removed before ranking.
 
@@ -956,11 +961,11 @@ If confinement is required and no provider is available, execution must fail. It
 
 A provider reports which controls from section 10.2 it can enforce and at what strength. A session fails at startup when its policy requires an unavailable control instead of running with weaker isolation.
 
-#### 10.4 Extension isolation
+#### 10.4 Extension trust
 
-Trusted first-party extensions may run in the daemon process. Third-party extensions, adopted extensions, and local MCP servers run as separate processes under the selected sandbox. They receive only capability RPC, bounded filesystem and network access, and credential handles. If the required isolation is unavailable, activation fails.
+Daemon extensions are trusted by placement. Code the user puts in `~/.axl/extensions/` runs inside the daemon process with the daemon's permissions. Axl does not sandbox that code; installing a file there is the trust decision. Extension code can use host filesystem, network, environment, and process authority directly. Sandbox and policy limits continue to govern model-invoked built-in tools and sandboxed MCP processes, not the extension implementation itself.
 
-V1 does not allow a third-party extension to be promoted into the daemon process. Declarative skills may load before process isolation is complete because they do not execute code.
+Project-local extension directories are not loaded until a project trust decision exists. Local MCP servers remain separate processes under the selected sandbox because they are foreign programs, not user-authored extension code.
 
 #### 10.5 Sandboxed browser
 
@@ -1317,6 +1322,7 @@ Use incremental terminal rendering principles:
 - Inline diffs and images
 - IME-safe cursor placement
 - Responsive layouts
+- An optional mascot that reflects session state, off by default, drawn through the same image and glyph ladder as any other media
 
 #### 16.2 Web
 
@@ -1586,7 +1592,7 @@ Resolve these before implementation because they affect irreversible boundaries.
 - [x] Define the first local wire protocol version as `1`, with exact-version compatibility before the first stable release.
 - [x] Confirm Apache-2.0 for Axl and establish the attribution process for behavior or fixtures derived from external projects.
 - [x] Record external reference revisions used during implementation.
-- [x] Keep third-party extensions out of the daemon process in v1. Only trusted first-party extensions may run in process.
+- [x] Treat global daemon extensions as trusted by placement and run them in process with daemon authority. Require explicit project trust before loading project-local executable extensions.
 - [x] Keep capability search local and lexical. V1 uses BM25, not embeddings or provider-native tool search.
 - [x] Record TypeScript definitions as the current implementation and defer code generation until a non-TypeScript client creates a concrete need.
 
@@ -1799,9 +1805,9 @@ After this gate, use Axl for ordinary development. Continue independent review o
 The Phase 4 gate still stands, but several current paths need replacement before dogfooding expands:
 
 - [x] Add a strict `exec` profile that exposes only sandboxed Bash and activates no Skills or MCP servers.
-- [ ] Replace the prompt-wide skill catalog with BM25 selection before each user turn.
-- [ ] Replace the generic MCP invocation path with turn-selected, provider-native tool schemas and frozen per-turn bindings.
-- [ ] Add `ask_user_question` to interactive sessions and verify that it is absent from goals and headless runs.
+- [x] Replace the prompt-wide skill catalog with daemon-owned BM25 search and session-scoped activation.
+- [x] Replace the generic MCP invocation path with provider-native tool schemas and session-scoped, frozen bindings.
+- [x] Add `ask_user_question` to interactive sessions and verify that it is absent from goals and headless runs.
 - [ ] Add blind credential brokering before dogfooding credentialed third-party extensions or local MCP servers.
 - [x] Keep the fail-closed sandbox default and test the explicit `--unsafe` mode separately.
 
@@ -1827,16 +1833,16 @@ The checked TUI items in this phase were pulled forward as an explicit exception
 
 #### Compaction
 
-- [ ] Implement proactive threshold compaction and overflow recovery.
+- [x] Implement proactive threshold compaction and overflow recovery.
 - [x] Implement manual compaction.
 - [x] Preserve turn boundaries and tool call/result integrity.
 - [x] Handle split turns and previous-summary iteration.
 - [x] Produce structured continuation summaries.
-- [ ] Track cumulative read and modified files.
+- [x] Track cumulative read and modified files.
 - [ ] Summarize branches independently and exclude side-channel branches.
 - [x] Retain original history outside the compacted model surface.
 - [x] Track compaction tokens and cost.
-- [ ] Add independent compaction behavior fixtures.
+- [x] Add independent compaction behavior fixtures.
 
 #### Session controls
 
@@ -1902,12 +1908,15 @@ The client-local terminal presentation surface was brought forward with the TUI.
 - [x] Return an idempotent disposer from every terminal registration.
 - [x] Require an explicit terminal capability manifest before activation.
 - [x] Keep daemon and kernel internals inaccessible from terminal extensions.
-- [x] Use the public tool-renderer registration for first-party MCP and Agent Skills presentation.
+- [x] Use the public tool-renderer registration for first-party Agent Skills presentation; native MCP tools use shared tool presentation.
 - [x] Remove extension-owned UI, listeners, and tracked work on disable, reload, rollback, and exit.
 
 ##### Remaining runtime and cross-client surface
 
-- [ ] Add `registerTool`, `registerSkill`, and runtime lifecycle listeners when their first working consumers need them.
+- [x] Add in-process daemon extensions loaded from `~/.axl/extensions/` with `registerTool`, `on("tool.call")`, `on("command")`, `on("session.event")`, and tracked cleanup.
+- [ ] Route daemon-level commands (providers, MCP configuration, session catalog) through `on("command")` once extensions can load outside a session.
+- [ ] Add `registerSkill` when its first working consumer needs it.
+- [ ] Load project-local `.axl/extensions/` after an explicit project trust decision.
 - [ ] Route shared-state extension commands through typed daemon RPC instead of client projection state.
 - [ ] Add `registerProvider`, `registerHook`, `registerTheme`, broader renderers, and `registerWebPanel` only when the first working consumer needs each API.
 - [ ] Require an explicit runtime capability manifest before activation.
@@ -1917,7 +1926,7 @@ The client-local terminal presentation surface was brought forward with the TUI.
 
 #### Resource formats
 
-The checked standards items were brought forward by request. They do not complete the Phase 6 extension API. The current prompt-wide skill catalog and generic MCP gateway are temporary and must be replaced by the BM25 and direct-tool path below.
+The checked standards items were brought forward by request. They do not complete the Phase 6 extension API. Agent Skills and MCP tools now use daemon-owned BM25 discovery and session-scoped activation.
 
 - [ ] Support native extensions, skills, hooks, prompt templates, themes, MCP servers, and `AGENTS.md`.
 - [x] Implement MCP natively against protocol version `2025-11-25`.
@@ -1927,20 +1936,20 @@ The checked standards items were brought forward by request. They do not complet
 
 #### Progressive capability discovery
 
-- [ ] Build one disposable BM25 index over enabled skill, tool, command, and agent metadata.
-- [ ] Store each capability's name, kind, description, aliases, path, and project or global scope.
-- [ ] Rank each user-authored turn before its first model request, with exact names and aliases first and project scope as the tie-breaker.
-- [ ] Apply a fixed relevance threshold and disclose no more than three matches.
-- [ ] Keep the stable prompt to a short statement that optional capabilities may be supplied with a request.
-- [ ] Append only compact metadata and a path for matching skills, commands, and agents. Let the model use the normal read tool to load full bodies.
+- [x] Build a disposable deterministic BM25 index for enabled Agent Skill metadata.
+- [x] Store stable identity, kind, name, description, aliases, path, scope, provenance, state, trust, availability, and required authority.
+- [x] Expose bounded explicit search with exact-name and alias priority, BM25 ranking, project-scope ties, and stable identity ordering.
+- [x] Omit zero-score records without imposing a fixed per-turn activation ceiling.
+- [x] Keep the stable prompt free of capability catalogs and Skill bodies.
+- [x] Return only compact metadata and canonical paths during search, then load full Skill instructions only during activation.
 - [ ] Let explicit user requests such as `/skill:pull-request` bypass ranking and load the named capability.
-- [ ] Expose a matching executable tool through its complete provider-native schema before inference, then dispatch it directly.
-- [ ] Freeze the selected tool roster and implementation bindings through every continuation in that turn.
-- [ ] Recompute the roster only at the next user-turn boundary and validate input again at dispatch.
-- [ ] Record every disclosed capability in the canonical log.
-- [ ] Remove disabled, unavailable, and untrusted capabilities before ranking. Discovery does not grant authority.
-- [ ] Do not add embeddings, a vector database, provider-native `tool_search`, or generic untyped invocation for normal tool execution.
-- [ ] Add a scoped harness-control capability for daemon RPCs.
+- [x] Expose matching executable tools through complete provider-native schemas before inference, then dispatch them directly.
+- [x] Keep additive Skill activations active for the rest of the session and restore them from canonical events after restart.
+- [x] Validate identity, policy, authority, availability, and containment at activation.
+- [x] Record searches, activations, denials, and exact model-visible additions canonically.
+- [x] Remove disabled, unavailable, untrusted, and unauthorized capabilities before indexing. Discovery does not grant authority.
+- [x] Do not add embeddings, a vector database, provider-native `tool_search`, or generic untyped invocation for normal tool execution.
+- [x] Add scoped harness-control capabilities for the `/compact` and `/reload` daemon operations.
 
 #### Blind credential foundation
 
@@ -1955,12 +1964,9 @@ The checked standards items were brought forward by request. They do not complet
 
 #### Executable activation boundary
 
-- [ ] Build a process host for third-party and adopted executable extensions before allowing them to activate.
-- [ ] Run those processes under the selected sandbox and expose only capability RPC.
-- [ ] Give untrusted processes bounded filesystem and network access plus credential handles, never raw managed credentials.
-- [ ] Fail activation when required isolation is unavailable.
-- [ ] Keep third-party in-process promotion out of v1.
-- [x] Allow declarative skills before the executable process host exists.
+- [x] Run user daemon extensions in the daemon process, trusted by placement in `~/.axl/extensions/` (section 10.4).
+- [ ] Require an explicit project trust decision before loading project-local extensions.
+- [ ] Give adopted and generated extensions a review and approval step before they are written into `~/.axl/extensions/` (section 8.4).
 - [x] Run local stdio MCP servers as sandboxed child processes.
 
 #### Initial first-party extensions
@@ -1972,7 +1978,7 @@ The checked standards items were brought forward by request. They do not complet
 
 #### Exit gate
 
-The terminal presentation surface already has first-party renderer consumers and deterministic cleanup. Phase 6 completes when the runtime registrations have real first-party consumers, disabled runtime features leave no prompt, UI, or background work, and untrusted executable extensions cannot run in the daemon process.
+The terminal presentation surface already has first-party renderer consumers and deterministic cleanup. Phase 6 completes when the runtime registrations have real first-party consumers and disabled runtime features leave no prompt, UI, or background work.
 
 ### Phase 7: Complete permission and isolation system
 
@@ -2010,12 +2016,11 @@ The terminal presentation surface already has first-party renderer consumers and
 - [ ] Add loopback-only port publishing by default.
 - [ ] Add per-site explicit opt-in for authenticated browsing.
 
-#### Extension isolation hardening
+#### Extension hardening
 
-- [ ] Add resource limits and lifecycle supervision to the Phase 6 extension process host.
 - [x] Apply resource limits and lifecycle cleanup to existing sandboxed stdio MCP processes.
-- [ ] Verify that extension processes cannot bypass filesystem, network, or credential policy through host APIs.
-- [ ] Keep trusted in-process execution limited to first-party extensions throughout v1.
+- [ ] Verify that extension tool-call gates and registered tools cannot widen filesystem, network, or credential policy through the extension seam.
+- [ ] Report extension handler failures through the daemon diagnostics surface instead of stderr.
 
 #### OCI runtime
 
@@ -2048,7 +2053,7 @@ The terminal presentation surface already has first-party renderer consumers and
 
 #### Exit gate
 
-Adversarial tests cannot escape workspace path rules, tool egress policy, extension process capabilities, or required container isolation. Missing enforcement always blocks execution.
+Adversarial tests cannot escape workspace path rules, tool egress policy, or required container isolation through the extension seam. Missing enforcement always blocks execution.
 
 ### Phase 8: Child sessions, modes, and orchestration
 
@@ -2485,13 +2490,19 @@ Resolve each decision only before its dependent phase:
 | Cross-provider and shared-team pooling | Phase 12 |
 | Remote connectivity topology | Resolved: hosted E2EE relay first; direct routing later |
 
+### Scoped sequencing exception: Axl Lounge
+
+Axl Lounge is implemented as a client-local feature. The terminal client uses the public `terminal.activities` and `terminal.activity-storage` capabilities. The web client has native game interfaces built on the same rule engines and save formats. It ships Wordle, Multiword (2, 4, or 8 Wordle boards on shared guesses), Honeycomb (seven-letter word hive), 2048, Minesweeper, Nonogram, Sudoku, and Chess Puzzles with deterministic offline data, bounded local storage, responsive Agent/game layouts, accessibility modes, and host-owned cleanup. Chess includes 1,000 reviewed CC0 Lichess tactics, exact sourced-line progression, and calibrated raster rendering with semantic fallback. Lounge does not change daemon or session authority. See [`docs/architecture/lounge.md`](docs/architecture/lounge.md).
+
+Web UI game support, Productive mode, and Vibe mode remain deferred.
+
 ### Immediate next slice
 
 Complete these dogfood fixes before continuing Phase 5:
 
-1. Add interactive-only `ask_user_question` with visible blocker behavior for non-interactive goals.
-2. Build the local BM25 capability index and log the three-or-fewer records disclosed for each user turn.
-3. Replace the generic MCP gateway with selected provider-native tool schemas and frozen per-turn dispatch bindings.
+1. [Complete] Add interactive-only `ask_user_question` with visible blocker behavior for non-interactive goals.
+2. [Complete] Build local BM25 capability search and canonical session-scoped Agent Skill activation.
+3. [Complete] Replace the generic MCP gateway with selected provider-native tool schemas and frozen session bindings.
 4. Add the bearer-token and basic-auth credential broker before using credentialed third-party processes in dogfood sessions.
 5. Serialize `edit` and `write` operations by canonical file path, re-read inside the queue, and reject stale exact-text edits before writing.
 6. Add bounded parallel tool execution with deterministic call/result ordering and explicit concurrency policy.

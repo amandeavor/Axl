@@ -12,10 +12,16 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import {
+  type ActivitySafeStatus,
+  type ActivityStorageAdapter,
   type TerminalCommandContext,
+  type TerminalCustomComponent,
   type TerminalExtension,
   TerminalExtensionHost,
   type TerminalLine,
+  type TerminalTheme,
+  type TerminalThemeRole,
+  type TerminalUi,
 } from "@axl/extension-api";
 import type {
   BlobReference,
@@ -32,8 +38,14 @@ import type {
   SessionProfile,
   SessionSummary,
   ThinkingLevel,
+  UserQuestionAnswer,
 } from "@axl/protocol";
-import { parseEventId, parseOperationId, parseSessionId } from "@axl/protocol";
+import {
+  parseEventId,
+  parseOperationId,
+  parseSessionId,
+  parseUserQuestionRequest,
+} from "@axl/protocol";
 import {
   type AxlClient,
   AxlClientError,
@@ -43,19 +55,39 @@ import {
   ConversationProjector,
   type DaemonHostControl,
   type DaemonHostStatus,
+  formatMcpServerSummary,
+  MCP_ADD_SERVER_QUESTIONS,
+  MascotActor,
+  MascotDirector,
+  type MascotManifest,
+  MascotPlayer,
+  MCP_IMPORT_QUESTION,
+  type McpImportedServer,
   type ModelRequestSettings,
+  mcpRequiredEnvironment,
+  mcpServerDefinitionFromDraft,
+  mcpServerDraftFromAnswers,
+  mcpServerReviewLines,
   orderPendingTurnInputs,
   type PresentationCommand,
   ProviderClientError,
+  parseMcpImport,
   restoreQueuedPrompts,
   type SessionSubscription,
   subscribeSession,
+  summarizeMcpServers,
   supportedThinkingLevels,
   THINKING_LEVELS,
   type TrustedProviderHost,
+  unknownNotice,
 } from "@axl/sdk";
-
 import { ActivityComponent } from "./activity.ts";
+import {
+  type ActivityAgentFrame,
+  type ActivityMonitorEntry,
+  type ActivityMonitorSnapshot,
+  ActivitySurfaceHost,
+} from "./activity-surface.ts";
 import { droppedImages, type LocalAttachment, readImageFile } from "./attachments.ts";
 import {
   type ClipboardContent,
@@ -74,23 +106,44 @@ import {
 } from "./diff-review.ts";
 import { decodeOneKey, LineEditor } from "./editor.ts";
 import { EditorFrameComponent } from "./editor-frame.ts";
-import { ExtensionWidgetsComponent } from "./extension-ui.ts";
+import { ExtensionCustomPrompt, ExtensionTextPrompt } from "./extension-prompt.ts";
+import { ExtensionWidgetsComponent, renderExtensionLines } from "./extension-ui.ts";
 import { editPromptExternally } from "./external-editor.ts";
-import { type FullscreenMouse, FullscreenScreen, fullscreenDockHeight } from "./fullscreen.ts";
+import {
+  type FloatingDialog,
+  type FullscreenMouse,
+  FullscreenScreen,
+  floatingDialogWidth,
+  fullscreenDockHeight,
+} from "./fullscreen.ts";
 import { isMouseReport } from "./fullscreen-input.ts";
 import { LiveAssistantComponent } from "./live-assistant.ts";
 import type { LoginDialogDefinition } from "./login-dialog.ts";
 import {
+  loadMascotAssets,
+  loadMascotAtlas,
+  loadMascotAtlasMirrored,
+  MascotAtlasRenderer,
+  MascotComponent,
+  type MascotPack,
+  packSegmentRows,
+  packTo256,
+} from "./mascot-render.ts";
+import { MascotSixelError, MascotSixelRenderer } from "./mascot-sixel.ts";
+import { McpPanelOverlay } from "./mcp-panel.ts";
+import {
   AttachmentBarComponent,
   detectTerminalMedia,
+  detectTruecolour,
   type ImageDisplay,
   MediaCache,
   type TerminalMediaCapabilities,
   uploadBlob,
 } from "./media.ts";
-import { type Overlay, OverlayStack } from "./overlay.ts";
+import { AttentionOverlaySlot, type Overlay, OverlayStack } from "./overlay.ts";
 import { PickerOverlay } from "./picker.ts";
 import { ProviderLoginOverlay, type ProviderLoginPresentation } from "./provider-login.ts";
+import { QuestionnaireOverlay } from "./questionnaire.ts";
 import {
   AUTOWRAP_OFF,
   AUTOWRAP_ON,
@@ -107,6 +160,7 @@ import {
 } from "./render.ts";
 import {
   assertInteractiveTerminal,
+  type TerminalCellSize,
   type TerminalInput,
   type TerminalOutput,
   TerminalSession,
@@ -119,13 +173,25 @@ import {
   themeNames,
 } from "./themes.ts";
 import { ToolTransactionStore } from "./tool-transaction.ts";
-import { type Palette, PLAIN_PALETTE, SessionView, type ToolOutputDisplay } from "./transcript.ts";
+import {
+  type Palette,
+  PLAIN_PALETTE,
+  SessionView,
+  type ThinkingDisplay,
+  type ToolOutputDisplay,
+} from "./transcript.ts";
 import {
   type TranscriptAppendOptions,
   TranscriptDocument,
   type TranscriptRow,
 } from "./transcript-document.ts";
 import { VimModeController } from "./vim-mode.ts";
+
+/** AXL_IMAGE_PROTOCOL=none turns every image off, the mascot's sixel included. */
+function imagesTurnedOff(): boolean {
+  const value = process.env.AXL_IMAGE_PROTOCOL?.toLowerCase();
+  return value === "none" || value === "0";
+}
 
 const SPINNER_FRAMES = ["◐", "◓", "◑", "◒"] as const;
 const FRAME_INTERVAL_MS = 16;
@@ -356,7 +422,13 @@ function openExternalUrl(url: string, onError: (error: Error) => void): void {
 }
 
 const TUI_COMMANDS: readonly { readonly name: string; readonly description: string }[] = [
+  { name: "lounge", description: "open, resume, close, or inspect Lounge" },
+  { name: "play", description: "open the Lounge game library" },
   { name: "theme", description: "select a color theme" },
+  {
+    name: "reload-tui",
+    description: "reload terminal extensions without rebuilding the daemon session",
+  },
   { name: "settings", description: "change persistent terminal preferences" },
   { name: "details", description: "set transcript detail: compact, full, or focus" },
   { name: "fullscreen", description: "switch to fullscreen transcript mode" },
@@ -367,6 +439,7 @@ const TUI_COMMANDS: readonly { readonly name: string; readonly description: stri
   { name: "stash", description: "stash, restore, swap, or clear the prompt" },
   { name: "favorite", description: "toggle a model in the favorites list" },
   { name: "developer", description: "toggle the optional developer panel" },
+  { name: "mascot", description: "toggle the mascot, /mascot <colour>, or /mascot sas" },
   { name: "vim", description: "toggle optional Vim editing" },
   { name: "commands", description: "browse and search available commands" },
   { name: "history", description: "search prompt history" },
@@ -529,7 +602,31 @@ export interface AxlAppOptions {
   readonly workspaceReview?: boolean;
   readonly imageDisplay?: ImageDisplay;
   readonly mediaCapabilities?: TerminalMediaCapabilities;
+  /** Show the mascot from the start. `/mascot` changes it and reports the change through `onPreferenceChange`. */
+  readonly mascot?: boolean;
+  readonly mascotColour?: string;
   readonly extensions?: readonly TerminalExtension[];
+  /** Local process host loads enabled presentation entries from daemon SDK inventory. */
+  readonly loadExtensions?: (
+    client: AxlClient,
+    sessionId: SessionId,
+  ) => Promise<readonly TerminalExtension[]>;
+  readonly activityStorage?: ActivityStorageAdapter;
+  readonly loungeEnabled?: boolean;
+  readonly loungeExtensionIds?: readonly string[];
+  readonly loungeLastActivityId?: string;
+  readonly loungeReducedMotion?: boolean;
+  readonly loungeTextOnly?: boolean;
+  readonly loadLoungePreferences?: () => Promise<{
+    readonly lastActivityId?: string;
+    readonly reducedMotion: boolean;
+    readonly textOnly: boolean;
+  }>;
+  readonly onLoungePreferenceChange?: (update: {
+    lastActivityId?: string;
+    reducedMotion?: boolean;
+    textOnly?: boolean;
+  }) => void | Promise<void>;
   readonly onPreferenceChange?: (update: {
     providerId?: string;
     modelId?: string;
@@ -552,6 +649,9 @@ export interface AxlAppOptions {
     diffLayout?: DiffLayout;
     workspaceReview?: boolean;
     imageDisplay?: ImageDisplay;
+    loungeEnabled?: boolean;
+    mascot?: boolean;
+    mascotColour?: string;
   }) => void | Promise<void>;
   /** Compatibility hook called after the daemon accepts a model switch. */
   readonly onModelChange?: (modelId: string) => void;
@@ -577,6 +677,23 @@ type TranscriptEntry =
   | { readonly kind: "lines"; readonly lines: readonly string[] };
 
 /** A terminal projection over one daemon-owned Axl session. */
+
+/** Notice after saving MCP servers: tool count plus which servers still need browser authorization. */
+function mcpAddedNotice(
+  names: readonly string[],
+  tools: number,
+  needsAuthorization: readonly string[],
+): string {
+  const subject = names.length === 1 ? `MCP server ${names[0]}` : `${names.length} MCP servers`;
+  const parts = [`· ${subject} added`];
+  if (tools > 0 || needsAuthorization.length === 0)
+    parts.push(`${tools} ${tools === 1 ? "tool" : "tools"}`);
+  if (needsAuthorization.length > 0) {
+    parts.push(`${needsAuthorization.join(", ")}: authorize in your browser when prompted`);
+  }
+  return parts.join(" · ");
+}
+
 export class AxlApp {
   sessionId: SessionId;
   private cwd: string;
@@ -594,14 +711,33 @@ export class AxlApp {
   private view: SessionView;
   private readonly editor = new LineEditor();
   private readonly editorFrame: EditorFrameComponent;
+  private readonly editorSurface: Component;
+  private editorSurfaceCursor: CursorPlacement | undefined;
+  private editorCompletions: readonly string[] | undefined;
   private readonly activity: ActivityComponent;
   private readonly liveAssistant: LiveAssistantComponent;
   private readonly attachmentBar: AttachmentBarComponent;
   private readonly mediaCache: MediaCache;
-  private readonly extensionHost: TerminalExtensionHost;
-  private readonly extensionWidgetsAbove: ExtensionWidgetsComponent;
-  private readonly extensionWidgetsBelow: ExtensionWidgetsComponent;
+  private readonly media: TerminalMediaCapabilities;
+  private extensionHost: TerminalExtensionHost;
+  private extensionCompletionRequest:
+    | { text: string; prefix: string; controller: AbortController }
+    | undefined;
+  private extensionCompletionResult:
+    | {
+        text: string;
+        prefix: string;
+        values: readonly string[];
+        labels: ReadonlyMap<string, string>;
+        cursors: ReadonlyMap<string, number>;
+      }
+    | undefined;
+  private extensionWidgetsAbove: ExtensionWidgetsComponent;
+  private extensionWidgetsBelow: ExtensionWidgetsComponent;
+  private readonly activitySurface: ActivitySurfaceHost;
   private readonly extensionCommandControllers = new Set<AbortController>();
+  private extensionReloading = false;
+  private extensionRefresh = Promise.resolve();
   private readonly fullscreen: FullscreenScreen;
   private tuiMode: "regular" | "fullscreen";
   private fullscreenExitOutput: "transcript" | "resume-hint";
@@ -616,6 +752,11 @@ export class AxlApp {
   private diffLayout: DiffLayout;
   private workspaceReviewEnabled: boolean;
   private imageDisplay: ImageDisplay;
+  private loungeEnabled: boolean;
+  private readonly loungeExtensionIds: readonly string[];
+  private loungeLastActivityId: string | undefined;
+  private loungeReducedMotion: boolean;
+  private loungeTextOnly: boolean;
   private readonly pendingAttachments: BlobReference[] = [];
   private attachmentBusy = false;
   private clipboardBusy = false;
@@ -629,14 +770,42 @@ export class AxlApp {
   private readonly awayChangedFiles = new Set<string>();
   private readonly document = new TranscriptDocument();
   private fullscreenRowsCache: readonly TranscriptRow[] | undefined;
+  private activitySurfaceRowOffset = 0;
+  private activityMouseCapture = false;
+  private activityAgentRowsCache:
+    | {
+        readonly width: number;
+        readonly palette: Palette;
+        readonly toolOutputDisplay: ToolOutputDisplay;
+        readonly thinkingDisplay: ThinkingDisplay;
+        readonly rows: readonly TranscriptRow[];
+      }
+    | undefined;
   private width: number;
   private height: number;
   private readonly transcript: TranscriptEntry[] = [];
   private notice: string | undefined;
+  /** Daemon-reported MCP summary for the footer, e.g. `mcp:2/3`. */
+  private mcpFooter: string | undefined;
+  private readonly attentionOverlay = new AttentionOverlaySlot();
   private readonly overlays = new OverlayStack();
   private stopped = false;
   private spinnerIndex = 0;
   private spinnerTimer: NodeJS.Timeout | null = null;
+  private mascot: MascotComponent | null = null;
+  private mascotPlayer: MascotPlayer | null = null;
+  private mascotDirector: MascotDirector | null = null;
+  private mascotTimer: NodeJS.Timeout | null = null;
+  private mascotActor: MascotActor | null = null;
+  private mascotSteppedAt = 0;
+  private mascotColour: string;
+  /** Numbers each mascot setup, so only the latest one is installed. */
+  private mascotSetup = 0;
+  /** The colour a setup still waiting is for, or null. */
+  private mascotPending: string | null = null;
+  /** What the terminal said about sixel, once asked; undefined until it answers. */
+  private terminalSixel: boolean | undefined;
+  private terminalAsked = false;
   private completionIndex = 0;
   private completionText = "";
   private unsubscribeDisconnect: () => void = () => undefined;
@@ -673,8 +842,12 @@ export class AxlApp {
   private interactionResponding = false;
   private interactionError: string | undefined;
   private readonly toolTransactions: ToolTransactionStore;
+  private readonly recentActivityTools: ActivityMonitorEntry[] = [];
+  private readonly observedActivityFiles = new Set<string>();
   private readonly toolGroupModes = new Map<string, ToolOutputDisplay>();
   private readonly terminal: TerminalSession;
+  private terminalCellSize: TerminalCellSize | undefined;
+  private terminalBackground: readonly [number, number, number] | undefined;
   private connectionState: "connected" | "reconnecting" | "detached" = "connected";
   private reconnectGeneration = 0;
   private reconnectAttempts = 0;
@@ -714,19 +887,26 @@ export class AxlApp {
     this.fullscreenMouse = options.fullscreenMouse ?? "capture";
     this.attention = options.attention ?? "off";
     this.editorMode = options.editorMode ?? "standard";
+    this.mascotColour = options.mascotColour ?? "Pink";
     this.modelFavorites = [...(options.modelFavorites ?? [])];
     this.refocusRecap = options.refocusRecap ?? false;
     this.developerPanelEnabled = options.developerPanel ?? false;
     this.diffLayout = options.diffLayout ?? "unified";
     this.workspaceReviewEnabled = options.workspaceReview ?? false;
     this.imageDisplay = options.imageDisplay ?? "auto";
+    this.loungeEnabled = options.loungeEnabled ?? true;
+    this.loungeExtensionIds = [...(options.loungeExtensionIds ?? [])];
+    this.loungeLastActivityId = options.loungeLastActivityId;
+    this.loungeReducedMotion = options.loungeReducedMotion ?? false;
+    this.loungeTextOnly = options.loungeTextOnly ?? false;
     this.webFetchEnabled = options.webFetch ?? true;
     this.webSearchEnabled = options.webSearch ?? true;
     this.initialResumePending = options.initialResume ?? false;
+    this.media = options.mediaCapabilities ?? detectTerminalMedia();
     this.mediaCache = new MediaCache(
       () => this.client,
       sessionId,
-      options.mediaCapabilities ?? detectTerminalMedia(),
+      this.media,
       () => this.imageDisplay,
       () => {
         if (!this.stopped && !this.hydrating) this.redraw();
@@ -765,9 +945,56 @@ export class AxlApp {
       options.modelCatalog,
       (reference, mediaWidth, mediaPalette) =>
         this.mediaCache.rows(reference, mediaWidth, this.tuiMode === "fullscreen", mediaPalette),
+      undefined,
+      () => this.extensionHost,
     );
     this.view.toolOutputDisplay = options.toolOutputDisplay ?? "compact";
-    this.extensionHost = new TerminalExtensionHost(options.extensions);
+    this.extensionHost = new TerminalExtensionHost(options.extensions, {
+      uiFor: (signal) => this.extensionCommandContext(signal),
+      initiallyInactiveExtensionIds: this.loungeEnabled ? [] : this.loungeExtensionIds,
+    });
+    const app = this;
+    this.activitySurface = new ActivitySurfaceHost({
+      // The host is replaced on reload and session change, so the surface must read it live.
+      get host() {
+        return app.extensionHost;
+      },
+      palette: () => this.view.palette,
+      invalidate: () => this.redraw(),
+      monitor: () => this.activityMonitorSnapshot(),
+      agentFrame: (width, height, focused) => this.activityAgentFrame(width, height, focused),
+      handleAgentInput: (data) => this.handleActivityAgentInput(data),
+      agentTabHint: () => (this.completionMatches().length > 0 ? "complete" : "game"),
+      presentation: () => ({
+        reducedMotion: this.loungeReducedMotion,
+        textOnly: this.loungeTextOnly,
+      }),
+      rasterProtocol: this.media.activityRaster ?? null,
+      terminalCellPixels: () => this.terminalCellSize,
+      returnToTranscript: () => {
+        if (this.tuiMode === "regular") this.repaintRegularTranscript();
+        this.redraw(true);
+      },
+      returnToEditor: () => this.redraw(true),
+      openWorkspaceReview: () => {
+        void this.openDiffReview("working");
+      },
+      reportError: (error) => {
+        this.notice = this.view.palette.error(
+          `✖ activity failed · ${sanitizeTerminalText(error.message)}`,
+        );
+        this.redraw();
+      },
+      setMouseCapture: (enabled) => {
+        this.activityMouseCapture = enabled;
+        this.syncTerminalMouseCapture();
+      },
+      ...(options.activityStorage === undefined ? {} : { storage: options.activityStorage }),
+      onActivityOpened: (activityId) => {
+        this.loungeLastActivityId = activityId;
+        return this.options.onLoungePreferenceChange?.({ lastActivityId: activityId });
+      },
+    });
     this.commandController = this.createCommandController(options.client);
     this.extensionWidgetsAbove = new ExtensionWidgetsComponent(
       this.extensionHost,
@@ -789,10 +1016,12 @@ export class AxlApp {
     );
     this.view.thinkingDisplay = options.thinkingDisplay ?? "compact";
     this.editorFrame = new EditorFrameComponent(this.editor, () => this.view);
+    this.editorSurface = { render: (width) => this.renderExtensionEditor(width) };
     this.activity = new ActivityComponent(() => this.view.palette);
     this.liveAssistant = new LiveAssistantComponent(
       () => this.view.palette,
       () => this.view.thinkingDisplay,
+      (text) => this.extensionHost.transformMarkdown(text, "assistant"),
     );
     this.attachmentBar = new AttachmentBarComponent(() => this.view.palette);
     this.developerPanel = new DeveloperPanelComponent(
@@ -807,6 +1036,10 @@ export class AxlApp {
     this.terminal = new TerminalSession({
       input: options.input,
       output: options.output,
+      onDeviceAttributes: (features) => {
+        this.terminalSixel = features.includes(4);
+        this.useSixelWhenKnown();
+      },
       onInput: (sequence) => {
         this.handleInput(sequence);
         if (!isMouseReport(sequence)) this.redraw(true);
@@ -816,6 +1049,15 @@ export class AxlApp {
         this.redraw();
       },
       onResize: this.resizeListener,
+      onBackground: (rgb) => {
+        this.terminalBackground = rgb;
+        if (!this.stopped && !this.hydrating && this.mascot !== null) this.redraw(true);
+      },
+      onCellSize: (size) => {
+        this.terminalCellSize = size;
+        this.useSixelWhenKnown();
+        if (!this.stopped && !this.hydrating) this.redraw(true);
+      },
       ...(options.suspendProcess === undefined ? {} : { suspendProcess: options.suspendProcess }),
     });
     this.bindClient(options.client);
@@ -825,8 +1067,9 @@ export class AxlApp {
     return [
       ...TUI_COMMANDS.filter(
         (command) =>
-          command.name !== "login" ||
-          this.client.connection.grantedCapabilities?.includes("provider.auth.login") !== true,
+          ((command.name !== "lounge" && command.name !== "play") || this.loungeEnabled) &&
+          (command.name !== "login" ||
+            this.client.connection.grantedCapabilities?.includes("provider.auth.login") !== true),
       ).map((command) => ({
         id: `tui.${command.name}`,
         name: command.name,
@@ -856,6 +1099,7 @@ export class AxlApp {
     this.client = client;
     this.commandController = this.createCommandController(client);
     this.unsubscribeDisconnect = client.onDisconnect((error) => {
+      this.activitySurface.suspend("disconnect");
       if (error instanceof AxlClientError && error.code === "daemon_stopping") {
         this.reconnectGeneration += 1;
         this.connectionState = "detached";
@@ -1019,6 +1263,7 @@ export class AxlApp {
             ...(options.profile === undefined ? {} : { profile: options.profile }),
             ...(options.webFetch === undefined ? {} : { webFetch: options.webFetch }),
             ...(options.webSearch === undefined ? {} : { webSearch: options.webSearch }),
+            userQuestions: true,
           })
         : await resumeSessionMetadata(options.client, options.sessionId);
     const cwd = opened?.cwd ?? options.cwd;
@@ -1049,7 +1294,11 @@ export class AxlApp {
     );
     try {
       await app.commandController.refresh(opened?.sessionId);
-      await app.extensionHost.activate();
+      if (opened !== undefined && options.loadExtensions !== undefined) {
+        await app.replaceTerminalExtensions(options.client, opened.sessionId);
+      } else {
+        await app.extensionHost.activate();
+      }
       void app.commandController.commands;
       const conflictingShortcut = app.extensionHost
         .shortcuts()
@@ -1086,6 +1335,7 @@ export class AxlApp {
     app.hydrating = false;
     app.setWorking(app.sessionSubscription?.projector.overview.activeOperationId !== undefined);
     app.openNextInteraction();
+    void app.refreshMcpStatus("open");
 
     try {
       await app.restartThemeWatcher(false);
@@ -1093,6 +1343,8 @@ export class AxlApp {
       if (app.tuiMode === "fullscreen") app.fullscreen.enter();
       else app.repaintRegularTranscript();
       app.paint();
+      // After the terminal is listening, so its answers are not typed.
+      if (options.mascot === true) void app.enableMascot(app.mascotColour);
       if (initialResume) void app.openResume();
       return app;
     } catch (error) {
@@ -1122,12 +1374,21 @@ export class AxlApp {
     this.stopThemeWatcher = undefined;
     for (const controller of this.extensionCommandControllers) controller.abort();
     this.extensionCommandControllers.clear();
+    this.extensionCompletionRequest?.controller.abort();
+    this.extensionCompletionRequest = undefined;
     this.providerOperation?.abort();
     this.providerOperation = undefined;
 
     const failures: unknown[] = [];
+    const activityCleanup = this.activitySurface.dispose();
+    try {
+      this.disableMascot();
+    } catch (error) {
+      failures.push(error);
+    }
     const extensionCleanup = this.extensionHost.dispose();
     try {
+      this.attentionOverlay.clear();
       this.overlays.clear();
     } catch (error) {
       failures.push(error);
@@ -1160,8 +1421,9 @@ export class AxlApp {
     } catch (error) {
       failures.push(error);
     }
+    const cleanup = Promise.all([activityCleanup, extensionCleanup]).then(() => undefined);
     if (notifyExit) {
-      void extensionCleanup.then(
+      void cleanup.then(
         () => {
           try {
             this.options.onExit?.();
@@ -1185,7 +1447,7 @@ export class AxlApp {
         },
       );
     } else {
-      void extensionCleanup.catch((error: unknown) => {
+      void cleanup.catch((error: unknown) => {
         this.options.output.write(
           `\r\nextension cleanup failed: ${error instanceof Error ? error.message : String(error)}\r\n`,
         );
@@ -1264,10 +1526,311 @@ export class AxlApp {
     return this.view.palette.dim(text);
   }
 
-  private liveFrame(includePendingTools = true): {
+  private terminalTheme(assertActive: () => void = () => undefined): TerminalTheme {
+    const app = this;
+    return {
+      get name() {
+        assertActive();
+        return app.currentTheme;
+      },
+      roles: () => {
+        assertActive();
+        return Object.keys(app.view.palette).filter(
+          (role) => role !== "thinking",
+        ) as TerminalThemeRole[];
+      },
+      style: (role, text) => {
+        assertActive();
+        const apply = Object.hasOwn(app.view.palette, role) ? app.view.palette[role] : undefined;
+        if (typeof apply !== "function")
+          throw new Error(`Theme ${app.currentTheme} has no ${role} role`);
+        return apply(sanitizeTerminalText(text));
+      },
+      thinking: (level, text) => {
+        assertActive();
+        const apply = app.view.palette.thinking;
+        if (apply === undefined) throw new Error(`Theme ${app.currentTheme} has no thinking role`);
+        return apply(level, sanitizeTerminalText(text));
+      },
+      fg: (tone, text) => {
+        assertActive();
+        return app.styledExtensionLine({ tone, text });
+      },
+      bold: (text) => {
+        assertActive();
+        return (app.view.palette.bold ?? ((value) => value))(sanitizeTerminalText(text));
+      },
+    };
+  }
+
+  private renderExtensionEditor(width: number): string[] {
+    const component = this.extensionHost.editor();
+    if (component === undefined) {
+      const rows = this.editorFrame.render(width);
+      this.editorSurfaceCursor = this.editorFrame.cursorPlacement();
+      return rows;
+    }
+    try {
+      const rendered = component.render(width, {
+        draft: this.editor.text,
+        model: this.view.modelLabel(),
+        working: this.view.working,
+        theme: this.terminalTheme(),
+      });
+      if (
+        !Array.isArray(rendered?.lines) ||
+        rendered.lines.length > 16 ||
+        rendered.lines.some((line) => typeof line?.text !== "string")
+      )
+        throw new TypeError("Custom editor must return at most 16 terminal lines");
+      const cursor = rendered.cursor;
+      if (
+        cursor !== undefined &&
+        (!Number.isSafeInteger(cursor.row) ||
+          cursor.row < 0 ||
+          cursor.row >= rendered.lines.length ||
+          !Number.isSafeInteger(cursor.column) ||
+          cursor.column < 0 ||
+          cursor.column >= width)
+      )
+        throw new TypeError("Custom editor cursor is outside the rendered frame");
+      this.editorSurfaceCursor =
+        cursor === undefined
+          ? undefined
+          : { ...cursor, row: cursor.row + (this.notice === undefined ? 0 : 1) };
+      return [
+        ...(this.notice === undefined ? [] : [truncateToWidth(this.notice, width, "")]),
+        ...rendered.lines.map((line) => {
+          const text = truncateToWidth(
+            sanitizeTerminalText(line.text).replace(/[\r\n]/gu, " "),
+            width,
+            "",
+          );
+          if (line.tone === "error") return this.view.palette.error(text);
+          if (line.tone === "accent") return this.view.palette.accent(text);
+          if (line.tone === "warning")
+            return (this.view.palette.warning ?? this.view.palette.accent)(text);
+          if (line.tone === "success")
+            return (this.view.palette.success ?? this.view.palette.accent)(text);
+          return line.tone === "muted" ? this.view.palette.dim(text) : text;
+        }),
+        ...(this.editorCompletions ?? []).map((line) => truncateToWidth(line, width, "")),
+      ];
+    } catch (error) {
+      this.editorSurfaceCursor = undefined;
+      return [
+        this.view.palette.error(
+          `✖ custom editor failed · ${extensionSingleLine(error instanceof Error ? error.message : String(error))}`,
+        ),
+      ];
+    }
+  }
+
+  private activityAgentRows(width: number): readonly TranscriptRow[] {
+    const cache = this.activityAgentRowsCache;
+    let settled: readonly TranscriptRow[];
+    if (
+      cache !== undefined &&
+      cache.width === width &&
+      cache.palette === this.view.palette &&
+      cache.toolOutputDisplay === this.view.toolOutputDisplay &&
+      cache.thinkingDisplay === this.view.thinkingDisplay
+    ) {
+      settled = cache.rows;
+    } else {
+      settled = this.buildTranscript(width).document.rows;
+      this.activityAgentRowsCache = {
+        width,
+        palette: this.view.palette,
+        toolOutputDisplay: this.view.toolOutputDisplay,
+        thinkingDisplay: this.view.thinkingDisplay,
+        rows: settled,
+      };
+    }
+    const pending = this.toolTransactions.rows(width);
+    const streaming = this.liveAssistant.render(width).map((text, rowInSource) => ({
+      text,
+      sourceId: "live-assistant",
+      prompt: false,
+      rowInSource,
+    }));
+    return [...settled, ...pending, ...streaming].slice(-200);
+  }
+
+  private activityAgentFrame(width: number, height: number, focused: boolean): ActivityAgentFrame {
+    const spinner = SPINNER_FRAMES[this.spinnerIndex % SPINNER_FRAMES.length] as string;
+    this.activity.update({
+      working: this.view.working || this.connectionState === "reconnecting",
+      label:
+        this.connectionState === "reconnecting"
+          ? "Reconnecting"
+          : this.activeRequest === "compaction"
+            ? "Compacting context… (Esc to cancel)"
+            : extensionSingleLine(this.extensionHost.workingLabel() ?? "Working"),
+      spinner,
+      elapsedSeconds: this.view.elapsedSeconds,
+      queued: this.queued.length,
+    });
+    this.updateEditorFrame();
+    this.attachmentBar.update(this.pendingAttachments);
+    this.updateDeveloperPanel();
+
+    const fixed: Component[] = [
+      this.extensionWidgetsAbove,
+      this.attachmentBar,
+      ...(this.developerPanelEnabled ? [this.developerPanel] : []),
+      { render: (frameWidth) => this.pendingInputStatusRows(frameWidth) },
+      this.activity,
+      this.editorFrame,
+      this.extensionWidgetsBelow,
+    ];
+    const measured = fixed.map((component) => component.render(width));
+    const fixedHeight = measured.reduce((total, rows) => total + rows.length, 0);
+    const bodyHeight = Math.max(0, height - fixedHeight);
+    const transcript =
+      bodyHeight === 0
+        ? []
+        : this.activityAgentRows(width)
+            .slice(-bodyHeight)
+            .map(({ text }) => text);
+    while (transcript.length < bodyHeight) transcript.unshift("");
+    const editorCursor = this.editorFrame.cursorPlacement();
+    const beforeEditor = measured
+      .slice(0, fixed.indexOf(this.editorFrame))
+      .reduce((total, rows) => total + rows.length, 0);
+    return clipFrame([...transcript, ...measured.flat()], height, {
+      row: transcript.length + beforeEditor + editorCursor.row,
+      column: editorCursor.column,
+      visible: focused && !this.view.working && this.connectionState === "connected",
+    });
+  }
+
+  private handleActivityAgentInput(data: string): boolean {
+    const key = decodeOneKey(data, 0).key;
+    if (key.kind === "shift-tab") return false;
+    if (key.kind === "tab" && this.completionMatches().length === 0) return false;
+    this.handleAgentInput(data);
+    return true;
+  }
+
+  private updateEditorFrame(): void {
+    const completion = this.completions();
+    this.editorCompletions = completion;
+    const editorMode = this.editorMode === "vim" ? this.vim.mode.toUpperCase() : undefined;
+    this.editorFrame.update({
+      gapAbove: this.mascot === null,
+      // Only a Kitty placement overlaps the border and needs hiding there; a
+      // sixel image stops above it, and the dark band would only show.
+      ...(this.mascot?.usesImages === true ? { opaqueBorder: this.mascotBorderColour() } : {}),
+      ...(this.notice === undefined ? {} : { notice: this.notice }),
+      ...(editorMode ? { mode: editorMode } : {}),
+      location: `${formatPath(this.cwd)}${this.branch ? `  git:${this.branch}` : ""}${
+        this.view.sandbox ? `  sandbox:${this.view.sandbox}` : ""
+      }${this.mcpFooter ? `  ${this.mcpFooter}` : ""}${this.connectionState === "connected" ? "" : `  · ${this.connectionState}`}${this.extensionHost
+        .statuses()
+        .map((line) => `  · ${this.styledExtensionLine(line)}`)
+        .join("")}`,
+      ...(completion === undefined ? {} : { completion }),
+    });
+  }
+
+  private updateDeveloperPanel(): void {
+    this.developerPanel.update({
+      sessionId: this.sessionId,
+      ...(this.branch === undefined ? {} : { branch: this.branch }),
+      ...(this.view.sandbox === undefined ? {} : { sandbox: this.view.sandbox }),
+      connection: this.connectionState,
+      phase: this.view.working ? "active" : "idle",
+      ...(this.workspaceDiff === undefined ? {} : { diff: this.workspaceDiff }),
+      ...(this.workspaceDiffError === undefined ? {} : { error: this.workspaceDiffError }),
+    });
+  }
+
+  private pendingInputStatusRows(width: number): string[] {
+    const pending = orderPendingTurnInputs(this.pendingTurnInputs);
+    const rows = pending.map(
+      (item, index) =>
+        `${index + 1}. ${item.mode === "steer" ? "Steering" : item.mode === "followUp" ? "Follow-up" : "Interrupt"}: ${extensionSingleLine(item.text) || "[attachment]"}`,
+    );
+    return [
+      ...(rows.length === 0
+        ? []
+        : ["", `Pending from this terminal (${rows.length}) · injection order`, ...rows]),
+      ...(this.view.working
+        ? [
+            this.activeRequest === "shell" || this.activeRequest === "compaction"
+              ? "Enter queues a follow-up · Esc cancels"
+              : "Enter steers next · Alt+Enter follows up · Ctrl+Enter interrupts and delivers",
+          ]
+        : []),
+    ].map((line) => this.view.palette.dim(truncateToWidth(line, width, "…")));
+  }
+
+  private activityMonitorSnapshot(): ActivityMonitorSnapshot {
+    const entries = this.toolTransactions.monitorEntries();
+    const current = entries.findLast(
+      (entry) => entry.status === "pending" || entry.status === "running",
+    );
+    const operation: ActivitySafeStatus["operation"] =
+      this.connectionState !== "connected"
+        ? "blocked"
+        : this.activeInteractionId !== undefined || this.interactionQueue.length > 0
+          ? "waiting"
+          : this.view.working
+            ? "working"
+            : "idle";
+    const pending = orderPendingTurnInputs(this.pendingTurnInputs);
+    return {
+      status: {
+        operation,
+        ...(this.view.working ? { elapsedMs: this.view.elapsedSeconds * 1_000 } : {}),
+        activeToolCount: entries.filter(
+          (entry) => entry.status === "pending" || entry.status === "running",
+        ).length,
+        queuedInput: {
+          steer: pending.filter((item) => item.mode === "steer").length,
+          followUp: pending.filter((item) => item.mode === "followUp").length + this.queued.length,
+          interrupt: pending.filter((item) => item.mode === "interrupt").length,
+        },
+      },
+      connection: this.connectionState,
+      ...(this.view.sandbox === undefined ? {} : { sandbox: this.view.sandbox }),
+      ...(current === undefined ? {} : { current }),
+      recent: this.recentActivityTools,
+      changes:
+        this.workspaceDiff?.files.map((file) => `${file.status} ${file.path}`).slice(0, 20) ??
+        [...this.observedActivityFiles].slice(0, 20),
+      changesAuthoritative: this.workspaceDiff !== undefined,
+    };
+  }
+
+  /**
+   * A dialog replaces the frame, but the mascot stays above it when both fit:
+   * a question or permission dialog is exactly when `ask` plays, and dropping
+   * the mascot for the dialog hid that state for as long as it was meant to
+   * show. The fit is measured before rendering, because the image path sends
+   * its atlas on the first render. A placement is not part of the text grid, so
+   * one left out would sit behind the dialog; it is removed explicitly.
+   */
+  private mascotAboveDialog(
+    rowsBelow: number,
+    frameHeight: number,
+  ): { above: string[]; clear: string } {
+    const mascot = this.mascot;
+    if (mascot === null) return { above: [], clear: "" };
+    if (rowsBelow + mascot.height <= frameHeight)
+      return { above: mascot.render(this.width), clear: "" };
+    return { above: [], clear: mascot.usesImages ? mascot.clearImage() : "" };
+  }
+
+  private liveFrame(
+    includePendingTools = true,
+    includeOverlay = true,
+  ): {
     lines: readonly string[];
     cursor?: CursorPlacement;
   } {
+    this.activitySurfaceRowOffset = 0;
     const unsafeComponents: Component[] = this.view.unsafe
       ? [
           {
@@ -1283,15 +1846,59 @@ export class AxlApp {
           },
         ]
       : [];
-    if (this.overlays.active !== undefined) {
+    const frameHeight =
+      this.tuiMode === "regular" ? this.height : fullscreenDockHeight(this.height);
+    if (includeOverlay && this.attentionOverlay.active !== undefined) {
       const prefix = unsafeComponents.flatMap((component) => component.render(this.width));
-      const lines = [...prefix, ...this.overlays.render(this.width)];
-      const cursor = this.overlays.cursorPlacement();
+      const dialog = this.attentionOverlay.render(this.width);
+      const { above, clear } = this.mascotAboveDialog(prefix.length + dialog.length, frameHeight);
+      const lines = [...prefix, ...above, ...dialog];
+      if (lines.length > 0) lines[0] = `${clear}${lines[0]}`;
+      const cursor = this.attentionOverlay.cursorPlacement();
+      const top = prefix.length + above.length;
       return clipFrame(
         lines,
-        this.tuiMode === "regular" ? this.height : fullscreenDockHeight(this.height),
-        cursor === undefined ? undefined : { ...cursor, row: prefix.length + cursor.row },
-        prefix.length + (this.overlays.active instanceof PickerOverlay ? 4 : 0),
+        frameHeight,
+        cursor === undefined ? undefined : { ...cursor, row: top + cursor.row },
+        top,
+      );
+    }
+    if (includeOverlay && this.overlays.active !== undefined) {
+      const prefix = unsafeComponents.flatMap((component) => component.render(this.width));
+      const overlay = this.overlays.render(this.width);
+
+      const { above, clear: clearMascot } = this.mascotAboveDialog(
+        prefix.length + overlay.length,
+        frameHeight,
+      );
+      const lines = [...prefix, ...above, ...overlay];
+      // The clear is not a row: a separate element would shift the cursor and
+      // the clipping by one.
+      if (lines.length > 0) lines[0] = `${clearMascot}${lines[0]}`;
+      const cursor = this.overlays.cursorPlacement();
+      const top = prefix.length + above.length;
+      return clipFrame(
+        lines,
+        frameHeight,
+        cursor === undefined ? undefined : { ...cursor, row: top + cursor.row },
+        top + (this.overlays.active instanceof PickerOverlay ? 4 : 0),
+      );
+    }
+    if (this.activitySurface.visible) {
+      const prefix = unsafeComponents.flatMap((component) => component.render(this.width));
+      this.activitySurfaceRowOffset =
+        prefix.length + (this.tuiMode === "fullscreen" ? this.height - frameHeight : 0);
+      const activityFrame = this.activitySurface.render(
+        this.width,
+        Math.max(1, frameHeight - prefix.length),
+      );
+      return clipFrame(
+        [...prefix, ...activityFrame.lines],
+        frameHeight,
+        activityFrame.cursor === undefined
+          ? undefined
+          : { ...activityFrame.cursor, row: prefix.length + activityFrame.cursor.row },
+        prefix.length,
       );
     }
 
@@ -1308,58 +1915,35 @@ export class AxlApp {
       elapsedSeconds: this.view.elapsedSeconds,
       queued: this.queued.length,
     });
-    const completion = this.completions();
-    const editorMode = this.editorMode === "vim" ? this.vim.mode.toUpperCase() : undefined;
-    this.editorFrame.update({
-      ...(this.notice === undefined ? {} : { notice: this.notice }),
-      ...(editorMode ? { mode: editorMode } : {}),
-      location: `${formatPath(this.cwd)}${this.branch ? `  git:${this.branch}` : ""}${
-        this.view.sandbox ? `  sandbox:${this.view.sandbox}` : ""
-      }${this.connectionState === "connected" ? "" : `  · ${this.connectionState}`}${this.extensionHost
-        .statuses()
-        .map((line) => `  · ${this.styledExtensionLine(line)}`)
-        .join("")}`,
-      ...(completion === undefined ? {} : { completion }),
-    });
+    this.updateEditorFrame();
     this.attachmentBar.update(this.pendingAttachments);
-    this.developerPanel.update({
-      sessionId: this.sessionId,
-      ...(this.branch === undefined ? {} : { branch: this.branch }),
-      ...(this.view.sandbox === undefined ? {} : { sandbox: this.view.sandbox }),
-      connection: this.connectionState,
-      phase: this.view.working ? "active" : "idle",
-      ...(this.workspaceDiff === undefined ? {} : { diff: this.workspaceDiff }),
-      ...(this.workspaceDiffError === undefined ? {} : { error: this.workspaceDiffError }),
-    });
+    this.updateDeveloperPanel();
     const fixed: Component[] = [
       ...unsafeComponents,
+      {
+        render: (width) =>
+          renderExtensionLines(
+            this.extensionHost.header().flatMap((widget) => widget.render(width)),
+            width,
+            this.view.palette,
+          ),
+      },
       this.extensionWidgetsAbove,
       this.attachmentBar,
       ...(this.developerPanelEnabled ? [this.developerPanel] : []),
-      {
-        render: (width) => {
-          const pending = orderPendingTurnInputs(this.pendingTurnInputs);
-          const rows = pending.map(
-            (item, index) =>
-              `${index + 1}. ${item.mode === "steer" ? "Steering" : item.mode === "followUp" ? "Follow-up" : "Interrupt"}: ${extensionSingleLine(item.text) || "[attachment]"}`,
-          );
-          return [
-            ...(rows.length === 0
-              ? []
-              : ["", `Pending from this terminal (${rows.length}) · injection order`, ...rows]),
-            ...(this.view.working
-              ? [
-                  this.activeRequest === "shell" || this.activeRequest === "compaction"
-                    ? "Enter queues a follow-up · Esc cancels"
-                    : "Enter steers next · Alt+Enter follows up · Ctrl+Enter interrupts and delivers",
-                ]
-              : []),
-          ].map((line) => this.view.palette.dim(truncateToWidth(line, width, "…")));
-        },
-      },
+      { render: (width) => this.pendingInputStatusRows(width) },
       this.activity,
-      this.editorFrame,
+      ...(this.mascot === null ? [] : [this.mascot]),
+      this.editorSurface,
       this.extensionWidgetsBelow,
+      {
+        render: (width) =>
+          renderExtensionLines(
+            this.extensionHost.footer().flatMap((widget) => widget.render(width)),
+            width,
+            this.view.palette,
+          ),
+      },
     ];
     const measured = fixed.map((component) => component.render(this.width));
     const reservedRows = measured.reduce((total, lines) => total + lines.length, 0);
@@ -1371,7 +1955,7 @@ export class AxlApp {
       includePendingTools ? Math.max(0, this.height - reservedRows - tools.length) : undefined,
     );
     const assistant = includePendingTools ? this.liveAssistant.render(this.width) : [];
-    const editorCursor = this.editorFrame.cursorPlacement();
+    const editorCursor = this.editorSurfaceCursor;
     const lines = [
       ...prefixRows,
       ...tools,
@@ -1384,13 +1968,14 @@ export class AxlApp {
       {
         row:
           measured
-            .slice(0, fixed.indexOf(this.editorFrame))
+            .slice(0, fixed.indexOf(this.editorSurface))
             .reduce((total, rows) => total + rows.length, 0) +
           tools.length +
           assistant.length +
-          editorCursor.row,
-        column: editorCursor.column,
-        visible: !this.view.working && this.connectionState === "connected",
+          (editorCursor?.row ?? 0),
+        column: editorCursor?.column ?? 0,
+        visible:
+          editorCursor !== undefined && !this.view.working && this.connectionState === "connected",
       },
       prefixRows.length,
     );
@@ -1413,13 +1998,14 @@ export class AxlApp {
         try {
           const values = extensionCommand.complete?.(prefix) ?? [];
           if (!Array.isArray(values)) throw new TypeError("completion must return an array");
-          return values
+          const matches = values
             .slice(0, MAX_EXTENSION_COMPLETIONS)
             .flatMap((value) =>
               typeof value === "string"
                 ? [`/${extensionCommand.name} ${extensionSingleLine(value)}`]
                 : [],
             );
+          return matches.length ? matches : this.extensionCompletionCandidates(text);
         } catch (error) {
           this.notice = this.view.palette.error(
             `✖ extension ${extensionCommand.extensionId} completion failed · ${extensionSingleLine(
@@ -1434,12 +2020,12 @@ export class AxlApp {
       /^(\/model|\/providers|\/login|\/logout|\/refresh|\/thinking|\/theme|\/details|\/favorite|\/developer|\/review|\/vim)\s+(\S*)$/.exec(
         text,
       );
-    if (!argument) return [];
+    if (!argument) return this.extensionCompletionCandidates(text);
     const [, command, query = ""] = argument;
     const values =
       command === "/model"
         ? [
-            ...this.providerInventory.flatMap((provider) =>
+            ...this.selectableProviders().flatMap((provider) =>
               provider.models.map((model) => `${provider.providerId}/${model.modelId}`),
             ),
             ...(this.providerInventory.length === 0 ? (this.options.models ?? []) : []),
@@ -1467,9 +2053,87 @@ export class AxlApp {
                     : command === "/vim"
                       ? ["on", "off"]
                       : ["compact", "full", "focus"];
-    return values
+    const matches = values
       .filter((value) => value.toLowerCase().startsWith(query.toLowerCase()))
       .map((value) => `${command} ${value}`);
+    return matches.length ? matches : this.extensionCompletionCandidates(text);
+  }
+
+  private extensionCompletionCandidates(text: string): readonly string[] {
+    if (this.extensionHost.autocomplete().length === 0) return [];
+    const prefix = this.editor.textBeforeCursor;
+    if (
+      this.extensionCompletionResult?.text === text &&
+      this.extensionCompletionResult.prefix === prefix
+    )
+      return this.extensionCompletionResult.values;
+    if (
+      this.extensionCompletionRequest?.text === text &&
+      this.extensionCompletionRequest.prefix === prefix
+    )
+      return [];
+    this.extensionCompletionRequest?.controller.abort();
+    const controller = new AbortController();
+    const request = { text, prefix, controller };
+    const host = this.extensionHost;
+    this.extensionCompletionRequest = request;
+    void Promise.all(
+      host
+        .autocomplete()
+        .map((provider) =>
+          Promise.resolve().then(() => provider.complete(prefix, controller.signal)),
+        ),
+    )
+      .then((groups) => {
+        if (
+          controller.signal.aborted ||
+          this.extensionCompletionRequest !== request ||
+          this.extensionHost !== host
+        )
+          return;
+        const labels = new Map<string, string>();
+        const cursors = new Map<string, number>();
+        const values = groups
+          .flatMap((group) => {
+            if (!Array.isArray(group))
+              throw new TypeError("Extension autocomplete must return an array");
+            return group.slice(0, MAX_EXTENSION_COMPLETIONS).flatMap((item) => {
+              if (typeof item?.value !== "string")
+                throw new TypeError("Extension autocomplete value must be a string");
+              const start = item.start ?? 0;
+              if (!Number.isSafeInteger(start) || start < 0 || start > prefix.length)
+                throw new TypeError("Extension autocomplete start is outside the prompt prefix");
+              const value =
+                text.slice(0, start) + extensionSingleLine(item.value) + text.slice(prefix.length);
+              if (value === text || labels.has(value)) return [];
+              if (item.label !== undefined && typeof item.label !== "string")
+                throw new TypeError("Extension autocomplete label must be a string");
+              labels.set(value, item.label === undefined ? "" : extensionSingleLine(item.label));
+              cursors.set(value, start + extensionSingleLine(item.value).length);
+              return [value];
+            });
+          })
+          .slice(0, MAX_EXTENSION_COMPLETIONS);
+        this.extensionCompletionResult = { text, prefix, values, labels, cursors };
+        this.extensionCompletionRequest = undefined;
+        this.redraw();
+      })
+      .catch((error: unknown) => {
+        if (controller.signal.aborted || this.extensionCompletionRequest !== request) return;
+        this.extensionCompletionRequest = undefined;
+        this.extensionCompletionResult = {
+          text,
+          prefix,
+          values: [],
+          labels: new Map(),
+          cursors: new Map(),
+        };
+        this.notice = this.view.palette.error(
+          `✖ extension autocomplete failed · ${extensionSingleLine(error instanceof Error ? error.message : String(error))}`,
+        );
+        this.redraw();
+      });
+    return [];
   }
 
   private completionMatches(): readonly string[] {
@@ -1494,7 +2158,7 @@ export class AxlApp {
     const matches = this.completionMatches();
     const selected = matches[this.completionIndex];
     if (selected === undefined) return false;
-    this.editor.setText(selected);
+    this.editor.setText(selected, this.extensionCompletionResult?.cursors.get(selected));
     this.completionText = selected;
     this.completionIndex = 0;
     return true;
@@ -1515,7 +2179,9 @@ export class AxlApp {
       ...visible.map((value, offset) => {
         const index = start + offset;
         const command = this.availableCommands().find((candidate) => candidate.name === value);
-        const description = command === undefined ? "" : `  ${dim(command.summary)}`;
+        const label = this.extensionCompletionResult?.labels.get(value);
+        const description =
+          command === undefined ? (label ? `  ${dim(label)}` : "") : `  ${dim(command.summary)}`;
         const line = `  ${index === this.completionIndex ? ">" : " "} ${value}${description}`;
         return index === this.completionIndex
           ? (this.view.palette.selection ?? accent)(line)
@@ -1560,19 +2226,36 @@ export class AxlApp {
     this.cancelRender();
     this.lastPaint = performance.now();
     const resized = this.applyResize();
-    const { lines, cursor } = this.liveFrame(this.tuiMode === "regular");
     if (this.tuiMode === "fullscreen") {
+      const floating = this.floatingDialog();
+      const dock = this.liveFrame(false, floating === undefined);
       this.fullscreen.render({
         document: this.fullscreenDocumentRows(),
-        dock: lines,
-        ...(cursor === undefined ? {} : { cursor }),
+        dock: dock.lines,
+        ...(dock.cursor === undefined || floating !== undefined ? {} : { cursor: dock.cursor }),
         palette: this.view.palette,
         sessionId: this.sessionId,
+        ...(floating === undefined ? {} : { floating }),
       });
       return;
     }
+    const { lines, cursor } = this.liveFrame(true);
     if (resized) this.repaintRegularTranscript(lines.length);
     this.options.output.write(this.screen.frame([{ render: () => [...lines] }], cursor));
+  }
+
+  /** In fullscreen mode every dialog floats over the transcript instead of replacing the dock. */
+  private floatingDialog(): FloatingDialog | undefined {
+    if (this.overlays.active === undefined) return undefined;
+    const width = floatingDialogWidth(this.width);
+    const cursor = this.overlays.cursorPlacement();
+    return {
+      // One column narrower than the box so right-aligned text never touches the border.
+      lines: this.overlays.render(width - 1),
+      width,
+      ...(cursor === undefined ? {} : { cursor }),
+      pinnedRows: this.overlays.active instanceof PickerOverlay ? 4 : 0,
+    };
   }
 
   private fullscreenDocumentRows() {
@@ -1589,8 +2272,13 @@ export class AxlApp {
     return this.fullscreenRowsCache;
   }
 
-  private invalidateFullscreenRows(): void {
+  /**
+   * Spinner ticks and streaming updates only change the live rows. They keep the Agent pane's
+   * settled transcript cache, because rebuilding it replays every stored event.
+   */
+  private invalidateFullscreenRows(settledChanged = true): void {
     this.fullscreenRowsCache = undefined;
+    if (settledChanged) this.activityAgentRowsCache = undefined;
   }
 
   private invalidateScreens(): void {
@@ -1616,6 +2304,7 @@ export class AxlApp {
 
   private setWorking(working: boolean): void {
     working = working && !this.stopped;
+    if (working) this.activitySurface.notifyOperationStarted();
     const changed = this.view.working !== working;
     this.view.working = working;
     if (changed) {
@@ -1623,14 +2312,14 @@ export class AxlApp {
         .emit({ type: working ? "working.start" : "working.end" })
         .then((errors) => this.reportExtensionErrors(errors));
     }
-    this.invalidateFullscreenRows();
+    this.invalidateFullscreenRows(false);
     if (working && this.spinnerTimer === null) {
       const started = Date.now();
       this.view.elapsedSeconds = 0;
       this.spinnerTimer = setInterval(() => {
         this.spinnerIndex += 1;
         this.view.elapsedSeconds = Math.floor((Date.now() - started) / 1000);
-        this.invalidateFullscreenRows();
+        this.invalidateFullscreenRows(false);
         this.redraw();
       }, 120);
       this.spinnerTimer.unref?.();
@@ -1638,6 +2327,284 @@ export class AxlApp {
       clearInterval(this.spinnerTimer);
       this.spinnerTimer = null;
       this.view.elapsedSeconds = 0;
+    }
+  }
+
+  /**
+   * Turns the mascot on or off. Colour is presentation preference only and
+   * carries no meaning about the session.
+   */
+  private async toggleMascot(colour?: string): Promise<void> {
+    const asked = colour === undefined || colour === "" ? undefined : colour;
+    if (asked === "sas") {
+      if (this.mascotPlayer === null) {
+        this.notice = this.view.palette.error("✖ /mascot sas needs the mascot on");
+        this.redraw();
+        return;
+      }
+      // A one-shot: it plays over whatever is running and hands back on its own.
+      this.mascotPlayer.play("sass");
+      this.redraw();
+      return;
+    }
+    // A setup still waiting counts as on, so a second /mascot turns it off.
+    const on = this.mascot !== null || this.mascotPending !== null;
+    const shown = this.mascotPending ?? this.mascotColour;
+    if (on && (asked === undefined || asked === shown)) {
+      this.disableMascot();
+      this.invalidateFullscreenRows();
+      this.redraw();
+      void this.persistPreferences({ mascot: false });
+      return;
+    }
+    const chosen = asked ?? this.mascotColour;
+    await this.enableMascot(chosen);
+    // A colour the manifest does not have fails in setup and leaves it off.
+    if (this.mascot !== null) void this.persistPreferences({ mascot: true, mascotColour: chosen });
+  }
+
+  /**
+   * Builds the mascot for the current display mode.
+   *
+   * The image path is chosen here, so a display-mode change has to come back
+   * through this: fullscreen suppresses inline images, and a component built
+   * for the image path would keep emitting graphics escapes into the dock.
+   */
+  private async enableMascot(requested: string): Promise<void> {
+    // Setup waits on files and on the terminal's answers. A newer /mascot, a
+    // display mode change or shutdown can come in meanwhile, so each setup is
+    // numbered and only the latest is installed.
+    const setup = ++this.mascotSetup;
+    const mode = this.tuiMode;
+    this.mascotPending = requested;
+    const current = () => setup === this.mascotSetup && !this.stopped;
+    try {
+      const loaded = await loadMascotAssets(requested);
+      const manifest = loaded.manifest;
+      // The text pack in 256 colours where the terminal has no 24-bit colour.
+      const pack = detectTruecolour() ? loaded.pack : packTo256(loaded.pack);
+      // Real pixels where the terminal supports the Kitty graphics protocol,
+      // sixel or the half-block pack otherwise. Fullscreen suppresses inline
+      // images, so it always uses the pack.
+      const wantsImages = this.media.images === "kitty" && this.tuiMode !== "fullscreen";
+      // Ask only now, when the mascot is turned on, and give the answer a
+      // moment, so the mascot does not show in glyphs first and then change.
+      if (!wantsImages && this.tuiMode === "regular") {
+        this.askCellSize();
+        await this.terminalAnswers(400);
+      }
+      if (wantsImages && this.terminalBackground === undefined) {
+        // The composer's border has to be painted a colour the terminal treats
+        // as its own, so ask what the terminal's background is.
+        this.terminal.queryBackground();
+        for (let waited = 0; this.terminalBackground === undefined && waited < 400; waited += 25) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+      }
+      // Without Kitty graphics, sixel where the terminal has said it draws
+      // them and how big a cell is: the image has to be exactly the strip's
+      // height, or it would be drawn over the composer.
+      const sixelCell =
+        !wantsImages && this.tuiMode === "regular" && this.terminalSixel === true
+          ? this.terminalCellSize
+          : undefined;
+      // The pack and the atlas are the same art, so rows measured from the
+      // pack tell the image path where each state sits without decoding a PNG.
+      const bands = packSegmentRows(pack, manifest);
+      const source = wantsImages
+        ? await this.atlasRenderer(requested, manifest)
+        : sixelCell === undefined
+          ? pack
+          : await this.sixelRenderer(requested, manifest, sixelCell, pack);
+      if (!current()) return;
+      if (this.tuiMode !== mode) {
+        // The drawing was chosen for the mode setup started in; choose again.
+        void this.enableMascot(requested);
+        return;
+      }
+      this.teardownMascot();
+      this.mascotPending = null;
+      this.mascotColour = requested;
+      const player = new MascotPlayer(manifest);
+      this.mascotPlayer = player;
+      this.mascotDirector = new MascotDirector(player);
+      this.mascot = new MascotComponent(player, source, {
+        column: 2,
+        bands,
+        totalRows: pack.cell[1],
+      });
+      this.mascotActor = new MascotActor();
+      this.mascotSteppedAt = Date.now();
+      this.mascotDirector.attach();
+      this.mascotTimer = setInterval(() => this.tickMascot(), 50);
+      this.mascotTimer.unref?.();
+      // The mascot appearing is its own confirmation, and a notice line would
+      // sit between it and the composer. A failure still reports loudly below.
+    } catch (error) {
+      if (!current()) return;
+      this.teardownMascot();
+      this.mascotPending = null;
+      this.notice = this.view.palette.error(
+        `✖ mascot: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    this.invalidateFullscreenRows();
+    this.redraw();
+  }
+
+  /** Turns the mascot off, and cancels a setup still waiting. */
+  private disableMascot(): void {
+    this.mascotSetup += 1;
+    this.mascotPending = null;
+    this.teardownMascot();
+  }
+
+  private teardownMascot(): void {
+    // Runs during shutdown too, when `stopped` is already set: the placement
+    // outlives the process otherwise and stays on the user's screen. The state
+    // goes first, so a write that fails cannot leave the timer running.
+    const clear = this.mascot?.usesImages === true ? this.mascot.clearImage() : "";
+    if (this.mascotTimer !== null) {
+      clearInterval(this.mascotTimer);
+      this.mascotTimer = null;
+    }
+    this.mascot = null;
+    this.mascotPlayer = null;
+    this.mascotDirector = null;
+    this.mascotActor = null;
+    if (clear !== "") this.options.output.write(clear);
+  }
+
+  private async atlasRenderer(
+    colour: string,
+    manifest: MascotManifest,
+  ): Promise<MascotAtlasRenderer> {
+    const atlas = await loadMascotAtlas(colour, manifest);
+    const mirrored = await loadMascotAtlasMirrored(colour, manifest);
+    return new MascotAtlasRenderer(atlas, manifest, mirrored === undefined ? {} : { mirrored });
+  }
+
+  /** Advances the mascot and repaints only when the visible frame changed. */
+  private tickMascot(): void {
+    if (this.stopped || this.mascotPlayer === null || this.mascot === null) return;
+    const now = Date.now();
+    const changed = this.mascotPlayer.tick(now);
+    const released = this.mascotDirector?.tick(now) ?? false;
+    const elapsed = now - this.mascotSteppedAt;
+    this.mascotSteppedAt = now;
+    let moved = false;
+    if (this.mascotActor !== null) {
+      moved = this.mascotActor.step(elapsed, {
+        state: this.mascotPlayer.state,
+        segment: this.mascotPlayer.segment,
+        width: this.width,
+        spriteWidth: this.mascot.width,
+        stripHeight: this.mascot.height,
+        cursorColumn: this.editorFrame.cursorPlacement().column,
+      });
+      const { column, sink, mirrored, travelling } = this.mascotActor.placement();
+      this.mascot.setColumn(column);
+      this.mascot.setSink(sink);
+      this.mascot.setMirrored(mirrored);
+      void travelling;
+    }
+    if (!changed && !released && !moved) return;
+    this.invalidateFullscreenRows();
+    this.redraw();
+  }
+
+  /** The sixel renderer, or the glyph pack when the atlas cannot be drawn as sixel. */
+  private async sixelRenderer(
+    colour: string,
+    manifest: MascotManifest,
+    cell: { readonly width: number; readonly height: number },
+    pack: MascotPack,
+  ): Promise<MascotSixelRenderer | MascotPack> {
+    try {
+      return new MascotSixelRenderer(await loadMascotAtlas(colour, manifest), manifest, cell);
+    } catch (error) {
+      // A user's own atlas that is not indexed cannot be drawn as sixel.
+      if (error instanceof MascotSixelError) return pack;
+      throw error;
+    }
+  }
+
+  /**
+   * Takes the terminal's answers to the sixel and cell size questions out of
+   * the input, so they are never typed. Once both are in, a mascot drawn in
+   * glyphs is rebuilt with sixel.
+   */
+  private takeTerminalReports(data: string): string {
+    if (!data.includes("\x1b[")) return data;
+    let rest = "";
+    let changed = false;
+    for (let index = 0; index < data.length; ) {
+      const decoded = decodeOneKey(data, index);
+      if (decoded.key.kind === "device-attributes") {
+        this.terminalSixel = decoded.key.features.includes(4);
+        changed = true;
+      } else if (decoded.key.kind === "cell-size") {
+        this.terminalCellSize = { width: decoded.key.width, height: decoded.key.height };
+        changed = true;
+      } else {
+        rest += data.slice(index, decoded.next);
+      }
+      index = decoded.next;
+    }
+    if (changed) this.useSixelWhenKnown();
+    return rest;
+  }
+
+  /**
+   * Asks the terminal once how big a cell is, which sixel needs to draw the
+   * mascot at exactly the strip's height. Whether it draws sixel at all comes
+   * from the device attributes the terminal session asks for at start.
+   */
+  private askCellSize(): void {
+    if (this.terminalAsked || this.media.images === "kitty" || imagesTurnedOff()) {
+      return;
+    }
+    this.terminalAsked = true;
+    this.options.output.write("\x1b[16t");
+  }
+
+  /**
+   * The colour of the composer's top border while a Kitty image is drawn. It
+   * has to differ from the terminal's default background, or the terminal
+   * leaves the image on top of the border. One level of blue is invisible, so
+   * the row looks unpainted. A terminal that does not answer the background
+   * query gets near black, which shows as a darker row.
+   */
+  private mascotBorderColour(): readonly [number, number, number] {
+    const background = this.terminalBackground;
+    if (background === undefined) return [1, 0, 0];
+    const [red, green, blue] = background;
+    return [red, green, blue === 255 ? 254 : blue + 1];
+  }
+
+  /** Waits up to `timeoutMs` for the terminal to say whether and how it draws sixel. */
+  private async terminalAnswers(timeoutMs: number): Promise<void> {
+    const settled = () =>
+      this.terminalSixel === false ||
+      (this.terminalSixel === true && this.terminalCellSize !== undefined);
+    for (let waited = 0; !settled() && this.terminalAsked && waited < timeoutMs; waited += 25) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+
+  /** Rebuilds a mascot drawn in glyphs with sixel once both answers are in. */
+  private useSixelWhenKnown(): void {
+    if (
+      this.terminalSixel === true &&
+      this.terminalCellSize !== undefined &&
+      this.mascotPlayer !== null &&
+      this.mascot !== null &&
+      !this.mascot.drawsSixel &&
+      !this.mascot.usesImages &&
+      this.tuiMode === "regular" &&
+      !imagesTurnedOff()
+    ) {
+      void this.enableMascot(this.mascotColour);
     }
   }
 
@@ -1659,6 +2626,7 @@ export class AxlApp {
 
   private commitEvent(event: CanonicalEvent, redraw = true): void {
     if (this.seenEventIds.has(event.id)) return;
+    this.mascotDirector?.handleEvent(event, Date.now());
     this.seenEventIds.add(event.id);
     this.transcript.push({ kind: "event", event });
     void this.extensionHost
@@ -1674,9 +2642,38 @@ export class AxlApp {
       }
     }
 
+    if (
+      this.extensionHost.activities().length > 0 &&
+      event.type === "tool.call" &&
+      ["edit", "write"].includes(event.payload.name)
+    ) {
+      const input = jsonObject(event.payload.input);
+      const path = input?.path ?? input?.filePath ?? input?.file_path;
+      if (typeof path === "string") this.observedActivityFiles.add(path);
+    }
+
     if (event.type === "config.tools") {
       this.webFetchEnabled = event.payload.webFetch;
       this.webSearchEnabled = event.payload.webSearch;
+    }
+    if (event.type === "config.dialect" && event.payload.reason === "reload" && !this.hydrating) {
+      void this.refreshMcpStatus("reload");
+    }
+    // Every runtime replacement records a resource snapshot, even without an AI dialect.
+    if (event.type === "context.resources" && !this.hydrating) {
+      if (this.options.loadExtensions !== undefined && !this.extensionReloading) {
+        const sessionId = this.sessionId;
+        this.extensionRefresh = this.extensionRefresh
+          .then(async () => {
+            if (this.stopped || sessionId !== this.sessionId) return;
+            await this.commandController.refresh(sessionId);
+            await this.replaceTerminalExtensions(this.client, sessionId);
+            this.redraw();
+          })
+          .catch((error: unknown) => {
+            this.reportExtensionErrors([error instanceof Error ? error : new Error(String(error))]);
+          });
+      }
     }
     if (event.type === "user.message") this.consumePendingTurnInput(event);
 
@@ -1711,11 +2708,24 @@ export class AxlApp {
       event.type === "session.error" ||
       (event.type === "assistant.message" && event.payload.stopReason !== "tool_use")
     ) {
+      if (event.type === "interaction.requested") this.activitySurface.suspend("attention");
+      else if (event.type === "session.error") {
+        this.activitySurface.close("failure");
+        void this.activitySurface.reset().catch((error: unknown) => {
+          this.notice = this.view.palette.error(
+            `✖ activity cleanup failed · ${error instanceof Error ? error.message : String(error)}`,
+          );
+        });
+      } else this.activitySurface.notifyCompletion();
       this.attend();
     }
     if (event.type === "tool.result") {
       void this.refreshBranch();
       const component = this.toolTransactions.settle(event);
+      if (component !== undefined && this.extensionHost.activities().length > 0) {
+        this.recentActivityTools.unshift(component.monitorEntry());
+        this.recentActivityTools.splice(20);
+      }
       this.invalidateFullscreenRows();
       if (component === undefined) {
         this.commitLines(
@@ -1735,7 +2745,7 @@ export class AxlApp {
       if (queued >= 0) this.interactionQueue.splice(queued, 1);
       if (this.activeInteractionId === event.payload.interactionId) {
         this.activeInteractionId = undefined;
-        this.overlays.close();
+        this.attentionOverlay.clear();
         this.openNextInteraction();
       }
     } else if (
@@ -1763,48 +2773,193 @@ export class AxlApp {
     this.redraw();
   }
 
-  private extensionCommandContext(controller: AbortController): TerminalCommandContext {
+  private extensionCommandContext(signal: AbortSignal): TerminalUi {
     const assertActive = (): void => {
-      if (controller.signal.aborted || this.stopped) {
+      if (signal.aborted || this.stopped) {
         throw new Error("Extension command context is no longer active");
       }
     };
+    const promptEvent = (
+      type: "ui.prompt.start" | "ui.prompt.end",
+      prompt: "select" | "confirm" | "input" | "editor" | "custom",
+    ): void => {
+      void this.extensionHost
+        .emit({ type, prompt })
+        .then((errors) => this.reportExtensionErrors(errors));
+    };
+    const select = (
+      title: string,
+      items: readonly { value: string; label: string; description?: string }[],
+      kind: "select" | "confirm" = "select",
+    ): Promise<string | undefined> =>
+      new Promise((resolvePromise) => {
+        if (signal.aborted || this.stopped) {
+          resolvePromise(undefined);
+          return;
+        }
+        if (this.overlays.active !== undefined) throw new Error("Terminal UI is busy");
+        promptEvent("ui.prompt.start", kind);
+        let settled = false;
+        const finish = (value: string | undefined): void => {
+          if (settled) return;
+          settled = true;
+          signal.removeEventListener("abort", abort);
+          promptEvent("ui.prompt.end", kind);
+          resolvePromise(value);
+        };
+        const abort = (): void => {
+          finish(undefined);
+          if (this.overlays.active === overlay) {
+            this.overlays.close();
+            this.redraw();
+          }
+        };
+        signal.addEventListener("abort", abort, { once: true });
+        const overlay = this.openPicker({
+          title: extensionSingleLine(title),
+          items: items.slice(0, MAX_EXTENSION_SELECTOR_ITEMS).map((item) => ({
+            value: item.value,
+            label: extensionSingleLine(item.label),
+            ...(item.description === undefined
+              ? {}
+              : { description: extensionSingleLine(item.description) }),
+          })),
+          current: "",
+          onPick: finish,
+          onCancel: () => finish(undefined),
+        });
+        this.redraw();
+      });
+    const prompt = (
+      title: string,
+      initial: string | undefined,
+      multiline: boolean,
+    ): Promise<string | undefined> =>
+      new Promise((resolvePromise) => {
+        if (signal.aborted || this.stopped) {
+          resolvePromise(undefined);
+          return;
+        }
+        if (this.overlays.active !== undefined) throw new Error("Terminal UI is busy");
+        const kind = multiline ? "editor" : "input";
+        promptEvent("ui.prompt.start", kind);
+        let settled = false;
+        const finish = (value: string | undefined): void => {
+          if (settled) return;
+          settled = true;
+          signal.removeEventListener("abort", abort);
+          promptEvent("ui.prompt.end", kind);
+          resolvePromise(value);
+          if (this.overlays.active === overlay) {
+            this.overlays.close();
+            this.openNextInteraction();
+            this.redraw();
+          }
+        };
+        const abort = (): void => finish(undefined);
+        const overlay = new ExtensionTextPrompt({
+          title,
+          ...(initial === undefined
+            ? {}
+            : multiline
+              ? { prefill: initial }
+              : { placeholder: initial }),
+          multiline,
+          palette: () => this.view.palette,
+          finish,
+          refresh: () => this.redraw(),
+        });
+        signal.addEventListener("abort", abort, { once: true });
+        this.overlays.push(overlay);
+        this.redraw();
+      });
+    const app = this;
     return {
-      signal: controller.signal,
+      signal,
+      hasUI: true,
+      mode: "tui",
       notify: (message, tone = "muted") => {
         assertActive();
         this.notice = this.styledExtensionLine({ text: `· ${message}`, tone });
         this.redraw();
       },
-      select: (title, items) =>
-        new Promise<string | undefined>((resolvePromise) => {
-          if (controller.signal.aborted || this.stopped) {
+      select,
+      confirm: async (title, message) =>
+        (await select(
+          `${title} · ${message}`,
+          [
+            { value: "yes", label: "Yes" },
+            { value: "no", label: "No" },
+          ],
+          "confirm",
+        )) === "yes",
+      input: (title, placeholder) => prompt(title, placeholder, false),
+      editor: (title, prefill) => prompt(title, prefill, true),
+      custom: <T>(
+        title: string,
+        create: (done: (value: T | undefined) => void) => TerminalCustomComponent,
+      ): Promise<T | undefined> =>
+        new Promise((resolvePromise) => {
+          if (signal.aborted || this.stopped) {
             resolvePromise(undefined);
             return;
           }
+          if (this.overlays.active !== undefined) throw new Error("Terminal UI is busy");
+          promptEvent("ui.prompt.start", "custom");
           let settled = false;
-          const finish = (value: string | undefined): void => {
+          let overlay: ExtensionCustomPrompt | undefined;
+          const finish = (value: T | undefined): void => {
             if (settled) return;
             settled = true;
-            controller.signal.removeEventListener("abort", abort);
+            signal.removeEventListener("abort", abort);
+            promptEvent("ui.prompt.end", "custom");
             resolvePromise(value);
+            if (overlay !== undefined && this.overlays.active === overlay) {
+              this.overlays.close();
+              this.openNextInteraction();
+              this.redraw();
+            }
           };
           const abort = (): void => finish(undefined);
-          controller.signal.addEventListener("abort", abort, { once: true });
-          this.openPicker({
-            title: extensionSingleLine(title),
-            items: items.slice(0, MAX_EXTENSION_SELECTOR_ITEMS).map((item) => ({
-              value: item.value,
-              label: extensionSingleLine(item.label),
-              ...(item.description === undefined
-                ? {}
-                : { description: extensionSingleLine(item.description) }),
-            })),
-            current: "",
-            onPick: (value) => finish(value),
-            onCancel: () => finish(undefined),
-          });
+          let component: TerminalCustomComponent;
+          try {
+            component = create(finish);
+            if (
+              typeof component?.render !== "function" ||
+              typeof component.handleKey !== "function"
+            )
+              throw new TypeError("Custom component must implement render and handleKey");
+          } catch (error) {
+            if (!settled) promptEvent("ui.prompt.end", "custom");
+            throw error;
+          }
+          if (settled) {
+            component.dispose?.();
+            return;
+          }
+          overlay = new ExtensionCustomPrompt(
+            component,
+            title,
+            () => this.view.palette,
+            () => finish(undefined),
+          );
+          signal.addEventListener("abort", abort, { once: true });
+          this.overlays.push(overlay);
+          this.redraw();
         }),
+      get theme(): TerminalTheme {
+        assertActive();
+        return app.terminalTheme(assertActive);
+      },
+      themes: () => {
+        assertActive();
+        return themeNames(this.themeDefinitions);
+      },
+      setTheme: (name) => {
+        assertActive();
+        if (this.themes[name] === undefined) throw new Error(`Unknown terminal theme ${name}`);
+        this.selectTheme(name);
+      },
       getEditorText: () => {
         assertActive();
         return this.editor.text;
@@ -1823,7 +2978,7 @@ export class AxlApp {
   ): void {
     const controller = new AbortController();
     this.extensionCommandControllers.add(controller);
-    Promise.resolve(action(this.extensionCommandContext(controller)))
+    Promise.resolve(action(this.extensionCommandContext(controller.signal)))
       .catch((error: unknown) => {
         if (controller.signal.aborted || this.stopped) return;
         const message = sanitizeTerminalText(
@@ -1847,29 +3002,47 @@ export class AxlApp {
     return true;
   }
 
-  private handleInput(data: string): void {
+  private handleInput(input: string): void {
+    // A paste is the user's text, whatever it holds, so the terminal's reports
+    // are only looked for outside one.
+    const pasted = input.startsWith("\x1b[200~") && input.endsWith("\x1b[201~");
+    const data = pasted ? input : this.takeTerminalReports(input);
+    if (data === "") return;
     if (this.stopped) return;
-    if (data.startsWith("\x1b[200~") && data.endsWith("\x1b[201~")) {
+    if (pasted) {
+      this.mascotDirector?.keystroke(Date.now());
       const text = data.slice(6, -6);
-      if (this.overlays.paste(text)) this.redraw();
-      else void this.handleBracketedPaste(text);
+      if (this.attentionOverlay.paste(text) || this.overlays.paste(text)) this.redraw();
+      else if (!this.activitySurface.visible || this.activitySurface.agentFocused)
+        void this.handleBracketedPaste(text);
       return;
     }
-    if (data === "\x16" && this.overlays.active?.paste !== undefined) {
-      void this.pasteClipboardIntoOverlay(this.overlays.active);
-      return;
+    if (data === "\x16") {
+      const overlay = this.attentionOverlay.active ?? this.overlays.active;
+      if (overlay?.paste !== undefined) {
+        void this.pasteClipboardIntoOverlay(overlay);
+        return;
+      }
     }
     if (data === "\x1b[I") {
       const wasAway = !this.focused;
       this.focused = true;
+      this.activitySurface.restoreTerminalFocus();
       if (wasAway && this.refocusRecap) this.showRefocusRecap();
-      this.redraw();
+      this.invalidateScreens();
+      this.redraw(true);
       return;
     }
     if (data === "\x1b[O") {
       this.focused = false;
       this.awayCompletedTurns = 0;
       this.awayChangedFiles.clear();
+      this.activitySurface.suspend("unfocused");
+      return;
+    }
+    if (this.attentionOverlay.active !== undefined) {
+      this.attentionOverlay.handleInput(data);
+      if (!this.stopped) this.redraw();
       return;
     }
     if (
@@ -1879,6 +3052,17 @@ export class AxlApp {
     ) {
       return;
     }
+    if (this.overlays.active === undefined && this.activitySurface.visible) {
+      if (data === "\x1a") this.suspend();
+      else if (data === "\x0c") this.invalidateScreens();
+      else if (data !== "\x04") {
+        this.activitySurface.handleInput(data, decodeOneKey, this.activitySurfaceRowOffset);
+      }
+      if (!this.stopped) this.redraw();
+      return;
+    }
+    // Focus and mouse reports are not typing.
+    if (!isMouseReport(data)) this.mascotDirector?.keystroke(Date.now());
     if (this.tuiMode === "fullscreen" && this.overlays.active === undefined) {
       if (this.fullscreen.handleInput(data)) {
         this.redraw();
@@ -1890,6 +3074,10 @@ export class AxlApp {
       if (!this.stopped) this.redraw();
       return;
     }
+    this.handleAgentInput(data);
+  }
+
+  private handleAgentInput(data: string): void {
     if (this.handleExtensionShortcut(data)) return;
 
     for (let index = 0; index < data.length; ) {
@@ -1900,7 +3088,30 @@ export class AxlApp {
       }
       const decoded = decodeOneKey(data, index);
       const key = decoded.key;
+      const rawKey = data.slice(index, decoded.next);
       index = decoded.next;
+      const customEditor = this.extensionHost.editor();
+      if (customEditor !== undefined && !isReservedExtensionShortcut(rawKey)) {
+        try {
+          const handled = customEditor.handleKey(rawKey, {
+            text: this.editor.text,
+            setText: (text) => {
+              this.editor.setText(sanitizeTerminalText(text));
+              this.redraw();
+            },
+          });
+          if (typeof handled !== "boolean")
+            throw new TypeError("Custom editor must return a boolean from handleKey");
+          if (handled) continue;
+        } catch (error) {
+          this.reportExtensionErrors([
+            new Error(
+              `Custom editor failed: ${error instanceof Error ? error.message : String(error)}`,
+            ),
+          ]);
+          return;
+        }
+      }
 
       if (key.kind === "up" && !this.editor.isBrowsingHistory && this.moveCompletion(-1)) {
         // Completion owns navigation only while editing the current draft.
@@ -1942,7 +3153,14 @@ export class AxlApp {
       } else if (key.kind === "shift-tab") {
         void this.cycleThinkingLevel();
       } else if (key.kind === "tab") {
-        if (!this.acceptCompletion()) this.editor.apply(key);
+        if (
+          !this.acceptCompletion() &&
+          !(
+            this.extensionCompletionRequest?.text === this.editor.text &&
+            this.extensionCompletionRequest.prefix === this.editor.textBeforeCursor
+          )
+        )
+          this.editor.apply(key);
       } else if (key.kind === "escape") {
         if (this.providerOperation !== undefined) {
           this.providerOperation.abort();
@@ -2039,7 +3257,7 @@ export class AxlApp {
       const content = this.options.readClipboard
         ? await this.options.readClipboard()
         : await readClipboardText();
-      if (this.overlays.active !== overlay) return;
+      if (this.attentionOverlay.active !== overlay && this.overlays.active !== overlay) return;
       if (typeof content === "string") overlay.paste?.(content);
       else this.notice = this.view.palette.error("✖ paste text into login fields, not an image");
     } catch (error) {
@@ -2410,8 +3628,43 @@ export class AxlApp {
     }
   }
 
+  private runLoungeCommand(action: string): void {
+    if (!action || action === "game") {
+      if (!this.activitySurface.resume() && !this.activitySurface.openPrimary()) {
+        this.notice = this.view.palette.dim("· no terminal activities are registered");
+      }
+    } else if (action === "resume") {
+      if (!this.activitySurface.resume()) {
+        const saved = this.loungeLastActivityId;
+        if (
+          saved !== undefined &&
+          this.extensionHost.activities().some((activity) => activity.id === saved)
+        ) {
+          this.activitySurface.open(saved);
+        } else {
+          this.notice = this.view.palette.dim("· no paused Lounge activity");
+        }
+      }
+    } else if (action === "close") {
+      this.activitySurface.close();
+    } else if (action === "status") {
+      this.notice = this.view.palette.dim(`· Lounge ${this.activitySurface.statusLabel()}`);
+    } else {
+      this.notice = this.view.palette.error(
+        "✖ use /lounge, /lounge game, /lounge resume, /lounge close, or /lounge status",
+      );
+    }
+    this.redraw();
+  }
+
   private async runPresentationCommand(name: string, argument?: string): Promise<void> {
     switch (name) {
+      case "lounge":
+        this.runLoungeCommand(argument ?? "");
+        return;
+      case "play":
+        this.runLoungeCommand("game");
+        return;
       case "quit":
         await this.quit();
         return;
@@ -2440,6 +3693,11 @@ export class AxlApp {
         return;
       case "edit":
         void this.openExternalEditor();
+        return;
+      case "reload-tui":
+        await this.replaceTerminalExtensions(this.client, this.sessionId);
+        this.notice = this.view.palette.accent("· terminal extensions reloaded");
+        this.redraw();
         return;
       case "web": {
         if (this.openWeb === undefined) throw new Error("Web launch is unavailable from this host");
@@ -2493,6 +3751,9 @@ export class AxlApp {
       case "settings":
         this.openSettings();
         return;
+      case "mcp":
+        this.openMcpPanel(argument?.trim() || undefined);
+        return;
       case "login":
         await this.loginProvider(argument);
         return;
@@ -2501,6 +3762,9 @@ export class AxlApp {
         return;
       case "theme":
         this.selectTheme(argument ?? "");
+        return;
+      case "mascot":
+        await this.toggleMascot(argument ?? "");
         return;
       case "status":
         this.commitLines([
@@ -2601,11 +3865,17 @@ export class AxlApp {
       return;
     }
     if (outcome.state === "completed") {
-      if (command === "rename") {
+      if (outcome.content !== undefined) {
+        this.notice = this.view.palette.dim(`· ${sanitizeTerminalText(outcome.content)}`);
+      } else if (command === "rename") {
         this.notice = this.view.palette.dim(
           `· renamed session to ${sanitizeTerminalText(argument ?? "")}`,
         );
       }
+      return;
+    }
+    if (outcome.state === "queued") {
+      this.notice = this.view.palette.dim(`· /${outcome.command} queued after the active response`);
       return;
     }
     switch (outcome.surface) {
@@ -2617,6 +3887,9 @@ export class AxlApp {
         return;
       case "providers":
         await this.showProviders(outcome.argument);
+        return;
+      case "mcp":
+        this.openMcpPanel(outcome.argument?.trim() || undefined);
         return;
       case "login":
         await this.loginProvider(outcome.argument);
@@ -2685,7 +3958,6 @@ export class AxlApp {
     const changesSession = command === "resume" || command === "fork" || command === "clone";
     const requiresIdle = new Set([
       "clone",
-      "compact",
       "delete",
       "dispose",
       "export",
@@ -2795,7 +4067,16 @@ export class AxlApp {
       (path) => tokens.has(path) || tokens.has(JSON.stringify(path)) || tokens.has(`'${path}'`),
     );
     if (line.startsWith("/") && !images.includes(command ?? "")) {
-      this.notice = this.view.palette.error(`✖ unknown command ${command}`);
+      this.notice = this.view.palette.error(
+        `✖ ${unknownNotice(
+          "command",
+          command ?? "",
+          this.commandController.commands.flatMap((c) => [
+            `/${c.name}`,
+            ...c.aliases.map((alias) => `/${alias}`),
+          ]),
+        )}`,
+      );
       return;
     }
 
@@ -2868,7 +4149,7 @@ export class AxlApp {
     if (rows.length === 0) return;
     this.document.appendRows(rows);
     this.invalidateFullscreenRows();
-    if (this.tuiMode === "regular" && !this.hydrating) {
+    if (this.tuiMode === "regular" && !this.hydrating && !this.activitySurface.visible) {
       this.options.output.write(this.screen.clear());
       this.options.output.write(`${rows.map((row) => row.text).join("\r\n")}\r\n`);
     }
@@ -2885,7 +4166,7 @@ export class AxlApp {
       if (remember) this.transcript.push({ kind: "lines", lines: [...lines] });
       this.document.append(lines, metadata);
       this.invalidateFullscreenRows();
-      if (this.tuiMode === "regular" && !this.hydrating) {
+      if (this.tuiMode === "regular" && !this.hydrating && !this.activitySurface.visible) {
         this.options.output.write(this.screen.clear());
         this.options.output.write(`${lines.join("\r\n")}\r\n`);
       }
@@ -2893,14 +4174,20 @@ export class AxlApp {
     if (redraw) this.redraw();
   }
 
-  private rebuildTranscript(repaint = true): void {
+  private buildTranscript(width: number): {
+    readonly view: SessionView;
+    readonly document: TranscriptDocument;
+    readonly pending: ToolTransactionStore;
+  } {
     const previous = this.view;
     const next = new SessionView(
-      this.width,
+      width,
       previous.palette,
       this.options.modelCatalog,
       (reference, mediaWidth, mediaPalette) =>
         this.mediaCache.rows(reference, mediaWidth, this.tuiMode === "fullscreen", mediaPalette),
+      undefined,
+      () => this.extensionHost,
     );
     next.thinkingDisplay = previous.thinkingDisplay;
     next.toolOutputDisplay = previous.toolOutputDisplay;
@@ -2920,13 +4207,13 @@ export class AxlApp {
         .map((component) => component.callId),
     );
     const flushTools = (): void => {
-      const rows = pending.drain(this.width);
+      const rows = pending.drain(width);
       document.appendRows(rows);
     };
     for (const entry of this.transcript) {
       if (entry.kind === "lines") {
         flushTools();
-        document.append(entry.lines.flatMap((line) => wrapLine(line, this.width)));
+        document.append(entry.lines.flatMap((line) => wrapLine(line, width)));
         continue;
       }
       const event = entry.event;
@@ -2965,12 +4252,17 @@ export class AxlApp {
     next.working = previous.working;
     next.elapsedSeconds = previous.elapsedSeconds;
     next.tokensPerSecond = previous.tokensPerSecond;
-    this.view = next;
-    this.toolTransactions.replace(pending);
-    this.document.replace(document.rows);
+    return { view: next, document, pending };
+  }
+
+  private rebuildTranscript(repaint = true): void {
+    const rebuilt = this.buildTranscript(this.width);
+    this.view = rebuilt.view;
+    this.toolTransactions.replace(rebuilt.pending);
+    this.document.replace(rebuilt.document.rows);
     this.invalidateFullscreenRows();
     if (!repaint) return;
-    if (this.tuiMode === "regular") {
+    if (this.tuiMode === "regular" && !this.activitySurface.visible) {
       this.repaintRegularTranscript();
       return;
     }
@@ -3001,6 +4293,15 @@ export class AxlApp {
   }
 
   private setTuiMode(mode: "regular" | "fullscreen"): void {
+    if (mode !== this.tuiMode && this.mascot !== null) {
+      // Rebuild for the new mode before switching: the source is chosen once,
+      // at construction, and fullscreen may not carry inline images.
+      const colour = this.mascotColour;
+      this.disableMascot();
+      queueMicrotask(() => {
+        if (!this.stopped) void this.enableMascot(colour);
+      });
+    }
     if (mode === this.tuiMode) {
       if (mode === "fullscreen") {
         this.fullscreen.invalidate();
@@ -3022,6 +4323,7 @@ export class AxlApp {
       this.tuiMode = mode;
       this.screen.reset(this.width);
     }
+    this.syncTerminalMouseCapture(true);
     void this.persistPreferences({ tuiMode: mode });
     this.rebuildTranscript(false);
     this.redraw();
@@ -3184,23 +4486,42 @@ export class AxlApp {
 
   private async openDiffReview(scope: WorkspaceReviewScope): Promise<void> {
     if (this.overlays.active !== undefined) return;
+    const loadingOverlay: Overlay = {
+      render: (width) =>
+        renderDialog({
+          title: "Workspace review",
+          rows: [this.view.palette.dim("Loading review…")],
+          footer: "Esc cancel",
+          width,
+          palette: this.view.palette,
+        }),
+      handleKey: (data) => {
+        if (decodeOneKey(data, 0).key.kind !== "escape") return;
+        if (this.overlays.active === loadingOverlay) this.overlays.close();
+        this.redraw();
+      },
+    };
+    this.notice = undefined;
+    this.overlays.replace(loadingOverlay);
+    this.redraw();
     const newlyEnabled = !this.workspaceReviewEnabled;
     if (newlyEnabled && !(await this.configureWorkspaceReview(true))) {
+      if (this.overlays.active === loadingOverlay) this.overlays.close();
       this.redraw();
       return;
     }
+    if (this.overlays.active !== loadingOverlay) return;
     if (newlyEnabled && scope === "last-turn") {
+      this.overlays.close();
       this.notice = this.view.palette.dim(
         "· workspace checkpoints enabled · last-turn review starts with the next prompt",
       );
       this.redraw();
       return;
     }
-    this.notice = this.view.palette.dim("· loading workspace review…");
-    this.redraw();
     try {
       const initial = await this.loadWorkspaceDiff(scope);
-      this.notice = undefined;
+      if (this.overlays.active !== loadingOverlay) return;
       this.overlays.replace(
         new DiffReviewOverlay({
           initial,
@@ -3221,6 +4542,8 @@ export class AxlApp {
         }),
       );
     } catch (error) {
+      if (this.overlays.active !== loadingOverlay) return;
+      this.overlays.close();
       this.notice = this.view.palette.error(
         `✖ ${error instanceof Error ? error.message : "Workspace review failed"}`,
       );
@@ -3242,6 +4565,246 @@ export class AxlApp {
             `  last call ${last.maxOutputTokens} output tokens · ${last.estimatedInputTokens} input estimate + ${last.contextReserveTokens} reserve / ${last.contextWindow} context`,
           ]),
     ];
+  }
+
+  private mcpCapabilityGranted(capability: string): boolean {
+    try {
+      return this.client.connection.grantedCapabilities?.includes(capability) === true;
+    } catch {
+      // The SDK throws while a reconnect is replacing the connection.
+      return false;
+    }
+  }
+
+  private mcpConfigurationGranted(): boolean {
+    return ["mcp.config.list", "mcp.config.upsert", "mcp.config.remove", "mcp.config.probe"].every(
+      (capability) => this.mcpCapabilityGranted(capability),
+    );
+  }
+
+  /** Projects the daemon's MCP discovery state into the footer and, on reload, a notice. */
+  private async refreshMcpStatus(reason: "open" | "reload"): Promise<void> {
+    if (this.stopped || !this.mcpCapabilityGranted("mcp.config.list")) return;
+    let servers: Awaited<ReturnType<AxlClient["listMcpServers"]>>["servers"];
+    try {
+      servers = (await this.client.listMcpServers()).servers;
+    } catch {
+      // The footer is a projection. A transient RPC failure must not interrupt the session.
+      return;
+    }
+    if (this.stopped) return;
+    const summary = summarizeMcpServers(servers);
+    this.mcpFooter = summary.total === 0 ? undefined : `mcp:${summary.discovered}/${summary.total}`;
+    if (summary.total > 0 && (reason === "reload" || summary.failed > 0)) {
+      const text = `· MCP · ${formatMcpServerSummary(summary)}`;
+      this.notice =
+        summary.failed > 0 ? this.view.palette.error(text) : this.view.palette.dim(text);
+    }
+    this.redraw();
+  }
+
+  private mcpActiveIdentities(): ReadonlySet<string> {
+    return new Set(
+      (this.sessionSubscription?.projector.state.activeCapabilities ?? []).map(
+        (event) => event.payload.capability.identity,
+      ),
+    );
+  }
+
+  private openMcpPanel(focus?: string): void {
+    if (!this.mcpConfigurationGranted()) {
+      this.notice = this.view.palette.error("✖ MCP configuration was not granted to this client");
+      this.redraw();
+      return;
+    }
+    const close = (): void => {
+      this.overlays.close();
+      this.openNextInteraction();
+      this.redraw();
+    };
+    this.overlays.replace(
+      new McpPanelOverlay({
+        palette: () => this.view.palette,
+        refresh: () => this.redraw(),
+        load: () => this.client.listMcpServers(),
+        activeIdentities: () => this.mcpActiveIdentities(),
+        ...(focus === undefined ? {} : { focus }),
+        onAdd: () => this.openMcpAddFlow(),
+        onImport: () => this.openMcpImportFlow(),
+        remove: async (name) => {
+          await this.client.removeMcpServer({ name });
+          await this.reloadAfterMcpChange(`· MCP server ${name} removed`);
+        },
+        setEnabled: async (name, enabled) => {
+          const current = (await this.client.listMcpServers()).servers.find(
+            (server) => server.name === name,
+          );
+          if (current === undefined) throw new Error(`MCP server ${name} is no longer configured`);
+          const { enabled: _previous, ...rest } = current.definition;
+          await this.client.upsertMcpServer({
+            name,
+            definition: enabled ? rest : { ...rest, enabled: false },
+          });
+          await this.reloadAfterMcpChange(
+            `· MCP server ${name} ${enabled ? "enabled" : "disabled"}`,
+          );
+        },
+        reload: () => this.reloadAfterMcpChange("· MCP servers reloaded"),
+        close,
+      }),
+    );
+    this.redraw();
+  }
+
+  private async reloadAfterMcpChange(notice: string): Promise<void> {
+    await this.commandController.invoke("/reload", this.sessionId);
+    this.notice = this.view.palette.dim(notice);
+    await this.refreshMcpStatus("open");
+  }
+
+  /** Quick import: paste a README config block, a URL, or a command line. */
+  private openMcpImportFlow(): void {
+    let configPath = "~/.axl/mcp.json";
+    void this.client
+      .listMcpServers()
+      .then((result) => {
+        configPath = result.path;
+        this.redraw();
+      })
+      .catch(() => undefined);
+    const parse = (answers: readonly UserQuestionAnswer[]): McpImportedServer[] =>
+      parseMcpImport(answers[0]?.customAnswer ?? "");
+    const dialog = new QuestionnaireOverlay({
+      title: "Import MCP servers",
+      questions: [MCP_IMPORT_QUESTION],
+      palette: () => this.view.palette,
+      refresh: () => this.redraw(),
+      submitLabel: "connect and save",
+      pendingLabel: "Connecting to each server and listing its tools…",
+      review: (answers) => {
+        try {
+          const servers = parse(answers);
+          const required = mcpRequiredEnvironment(servers);
+          return [
+            `Will be written to ${configPath} as:`,
+            ...JSON.stringify(
+              Object.fromEntries(servers.map((server) => [server.name, server.definition])),
+              null,
+              2,
+            ).split("\n"),
+            "",
+            ...(required.length === 0
+              ? []
+              : [
+                  `Reads from the daemon's environment: ${required.join(", ")}. Export them before starting axl.`,
+                ]),
+            "Axl connects to each server first and saves only if all of them answer. A server that asks for OAuth is saved and authorized in your browser when the session reloads.",
+          ];
+        } catch (error) {
+          return [
+            this.view.palette.error(
+              `✖ ${error instanceof Error ? error.message : "Invalid input"}`,
+            ),
+          ];
+        }
+      },
+      submit: async (answers) => {
+        const servers = parse(answers);
+        let tools = 0;
+        const needsAuthorization: string[] = [];
+        for (const server of servers) {
+          try {
+            const probed = await this.client.probeMcpServer(server);
+            tools += probed.tools.length;
+            if (probed.authorization === "required") needsAuthorization.push(server.name);
+          } catch (error) {
+            throw new Error(
+              `${server.name}: ${error instanceof Error ? error.message : "connection failed"}`,
+            );
+          }
+        }
+        for (const server of servers) await this.client.upsertMcpServer(server);
+        this.overlays.close();
+        this.openMcpPanel(servers[0]?.name);
+        await this.reloadAfterMcpChange(
+          mcpAddedNotice(
+            servers.map((server) => server.name),
+            tools,
+            needsAuthorization,
+          ),
+        );
+      },
+      cancel: async () => {
+        this.overlays.close();
+        this.openMcpPanel();
+      },
+    });
+    this.overlays.replace(dialog);
+    this.redraw();
+  }
+
+  /** Guided add flow: the same stepped questionnaire the model uses for ask_user_question. */
+  private openMcpAddFlow(): void {
+    let configPath = "~/.axl/mcp.json";
+    void this.client
+      .listMcpServers()
+      .then((result) => {
+        configPath = result.path;
+        this.redraw();
+      })
+      .catch(() => undefined);
+    const build = (answers: readonly UserQuestionAnswer[]) =>
+      mcpServerDefinitionFromDraft(mcpServerDraftFromAnswers(answers));
+    const dialog = new QuestionnaireOverlay({
+      title: "Add MCP server",
+      questions: MCP_ADD_SERVER_QUESTIONS,
+      palette: () => this.view.palette,
+      refresh: () => this.redraw(),
+      submitLabel: "connect and save",
+      pendingLabel: "Connecting to the server and listing its tools…",
+      review: (answers) => {
+        try {
+          const { name, definition } = build(answers);
+          const required = mcpRequiredEnvironment([{ definition }]);
+          return [
+            ...mcpServerReviewLines(name, definition, configPath),
+            "",
+            ...(required.length === 0
+              ? []
+              : [
+                  `Reads from the daemon's environment: ${required.join(", ")}. Export them before starting axl.`,
+                ]),
+            "Axl connects first and saves only if the server answers. A server that asks for OAuth is saved and authorized in your browser when the session reloads.",
+          ];
+        } catch (error) {
+          return [
+            this.view.palette.error(
+              `✖ ${error instanceof Error ? error.message : "Incomplete answers"}`,
+            ),
+          ];
+        }
+      },
+      submit: async (answers) => {
+        const { name, definition } = build(answers);
+        const probed = await this.client.probeMcpServer({ name, definition });
+        await this.client.upsertMcpServer({ name, definition });
+        this.overlays.close();
+        this.openMcpPanel(name);
+        await this.reloadAfterMcpChange(
+          mcpAddedNotice(
+            [name],
+            probed.tools.length,
+            probed.authorization === "required" ? [name] : [],
+          ),
+        );
+      },
+      cancel: async () => {
+        this.overlays.close();
+        this.openMcpPanel();
+      },
+    });
+    this.overlays.replace(dialog);
+    this.redraw();
   }
 
   private openSettings(): void {
@@ -3278,6 +4841,25 @@ export class AxlApp {
           description: this.workspaceReviewEnabled ? "on" : "off",
         },
         {
+          value: "lounge",
+          label: "Axl Lounge",
+          description: this.loungeEnabled ? "on" : "off",
+        },
+        ...(this.loungeEnabled
+          ? [
+              {
+                value: "lounge-motion",
+                label: "Lounge reduced motion",
+                description: this.loungeReducedMotion ? "on" : "off",
+              },
+              {
+                value: "lounge-text",
+                label: "Lounge text-only",
+                description: this.loungeTextOnly ? "on" : "off",
+              },
+            ]
+          : []),
+        {
           value: "web-fetch",
           label: "Web fetch tool",
           description: this.webFetchEnabled ? "on" : "off",
@@ -3307,10 +4889,96 @@ export class AxlApp {
         else if (value === "recap") this.selectRefocusRecap();
         else if (value === "developer") this.selectDeveloperPanel();
         else if (value === "review") this.selectWorkspaceReview();
+        else if (value === "lounge") this.selectLoungeEnabled();
+        else if (value === "lounge-motion") this.selectLoungeAccessibility("reducedMotion");
+        else if (value === "lounge-text") this.selectLoungeAccessibility("textOnly");
         else if (value === "web-fetch") this.selectWebTool("webFetch");
         else if (value === "web-search") this.selectWebTool("webSearch");
         else if (value === "images") this.selectImageDisplay();
         else this.selectDiffLayout();
+      },
+    });
+  }
+
+  private selectLoungeEnabled(): void {
+    this.openPicker({
+      title: "Axl Lounge",
+      items: [
+        { value: "on", label: "On", description: "enable Lounge commands and activities" },
+        { value: "off", label: "Off", description: "remove all Lounge activity and work" },
+      ],
+      current: this.loungeEnabled ? "on" : "off",
+      onPick: (value) => void this.setLoungeEnabled(value === "on"),
+    });
+  }
+
+  private async setLoungeEnabled(enabled: boolean): Promise<void> {
+    if (enabled === this.loungeEnabled) return;
+    try {
+      if (enabled) {
+        await this.options.onPreferenceChange?.({ loungeEnabled: true });
+        const preferences = await this.options.loadLoungePreferences?.();
+        if (preferences !== undefined) {
+          this.loungeLastActivityId = preferences.lastActivityId;
+          this.loungeReducedMotion = preferences.reducedMotion;
+          this.loungeTextOnly = preferences.textOnly;
+        }
+        for (const extensionId of this.loungeExtensionIds) {
+          await this.extensionHost.setExtensionEnabled(extensionId, true);
+        }
+        this.loungeEnabled = true;
+        this.notice = this.view.palette.dim("· Axl Lounge enabled");
+      } else {
+        this.loungeEnabled = false;
+        await this.activitySurface.reset();
+        for (const extensionId of [...this.loungeExtensionIds].reverse()) {
+          await this.extensionHost.setExtensionEnabled(extensionId, false);
+        }
+        await this.options.onPreferenceChange?.({ loungeEnabled: false });
+        this.notice = this.view.palette.dim("· Axl Lounge disabled");
+      }
+    } catch (error) {
+      if (enabled) {
+        for (const extensionId of [...this.loungeExtensionIds].reverse()) {
+          await this.extensionHost.setExtensionEnabled(extensionId, false).catch(() => undefined);
+        }
+        await Promise.resolve(this.options.onPreferenceChange?.({ loungeEnabled: false })).catch(
+          () => undefined,
+        );
+        this.loungeEnabled = false;
+      }
+      this.notice = this.view.palette.error(
+        `✖ ${sanitizeTerminalText(error instanceof Error ? error.message : "Lounge setting failed")}`,
+      );
+    }
+    this.redraw();
+  }
+
+  private selectLoungeAccessibility(setting: "reducedMotion" | "textOnly"): void {
+    const current = setting === "reducedMotion" ? this.loungeReducedMotion : this.loungeTextOnly;
+    this.openPicker({
+      title: setting === "reducedMotion" ? "Lounge reduced motion" : "Lounge text-only",
+      items: [
+        { value: "on", label: "On" },
+        { value: "off", label: "Off" },
+      ],
+      current: current ? "on" : "off",
+      onPick: (value) => {
+        const next = value === "on";
+        if (setting === "reducedMotion") this.loungeReducedMotion = next;
+        else this.loungeTextOnly = next;
+        this.activitySurface.presentationChanged();
+        void Promise.resolve(this.options.onLoungePreferenceChange?.({ [setting]: next })).catch(
+          (error: unknown) => {
+            if (setting === "reducedMotion") this.loungeReducedMotion = current;
+            else this.loungeTextOnly = current;
+            this.activitySurface.presentationChanged();
+            this.notice = this.view.palette.error(
+              `✖ ${sanitizeTerminalText(error instanceof Error ? error.message : "Lounge setting failed")}`,
+            );
+            this.redraw();
+          },
+        );
       },
     });
   }
@@ -3374,6 +5042,14 @@ export class AxlApp {
     });
   }
 
+  private syncTerminalMouseCapture(refresh = false): void {
+    this.terminal.setMouseCapture(
+      this.activityMouseCapture ||
+        (this.tuiMode === "fullscreen" && this.fullscreenMouse === "capture"),
+    );
+    if (refresh) this.terminal.refreshMouseCapture();
+  }
+
   private selectFullscreenMouse(): void {
     this.openPicker({
       title: "Fullscreen mouse",
@@ -3385,6 +5061,7 @@ export class AxlApp {
       onPick: (value) => {
         this.fullscreenMouse = value as FullscreenMouse;
         this.fullscreen.setMouse(this.fullscreenMouse);
+        this.syncTerminalMouseCapture(true);
         void this.persistPreferences({ fullscreenMouse: this.fullscreenMouse });
         this.redraw();
       },
@@ -3600,7 +5277,9 @@ export class AxlApp {
     if (name) {
       const palette = this.themes[name];
       if (!palette) {
-        this.notice = this.view.palette.error(`✖ unknown theme ${name}`);
+        this.notice = this.view.palette.error(
+          `✖ ${unknownNotice("theme", name, Object.keys(this.themes))}`,
+        );
         return;
       }
       this.currentTheme = name;
@@ -3641,17 +5320,45 @@ export class AxlApp {
       providerId === undefined ? {} : { providerId },
       signal === undefined ? {} : { signal },
     );
-    if (providerId === undefined) this.providerInventory = listed.providers;
+    // The listing carries each provider's last known state. The status request
+    // checks the credentials, so a provider logged in through the environment
+    // or a stored key is not mistaken for a logged out one.
+    const statuses = this.client.connection.grantedCapabilities?.includes("provider.auth.status")
+      ? (
+          await this.client.providerAuthenticationStatus(
+            providerId === undefined ? {} : { providerId },
+            signal === undefined ? {} : { signal },
+          )
+        ).providers
+      : [];
+    const providers = listed.providers.map((provider) => ({
+      ...provider,
+      authentication:
+        statuses.find((status) => status.providerId === provider.providerId) ??
+        provider.authentication,
+    }));
+    if (providerId === undefined) this.providerInventory = providers;
     else {
       const retained = this.providerInventory.filter(
         (provider) => provider.providerId !== providerId,
       );
-      this.providerInventory = [...retained, ...listed.providers];
+      this.providerInventory = [...retained, ...providers];
     }
     this.view.setModels(
       this.providerInventory.flatMap((provider) => provider.models.map(formatProviderModel)),
     );
-    return listed.providers;
+    return providers;
+  }
+
+  /**
+   * Providers whose models can be chosen. A model of a provider that is not
+   * logged in cannot be selected, so, as in pi, the pickers and completions
+   * list only models with configured authentication.
+   */
+  private selectableProviders(): readonly ProviderInventoryGroup[] {
+    return this.providerInventory.filter(
+      (provider) => provider.authentication.phase === "authenticated",
+    );
   }
 
   private modelSelection(
@@ -3661,13 +5368,13 @@ export class AxlApp {
     if (separator > 0) {
       const providerId = value.slice(0, separator);
       const modelId = value.slice(separator + 1);
-      const provider = this.providerInventory.find(
+      const provider = this.selectableProviders().find(
         (candidate) => candidate.providerId === providerId,
       );
       const model = provider?.models.find((candidate) => candidate.modelId === modelId);
       return model === undefined ? undefined : { providerId, model };
     }
-    const candidates = this.providerInventory.flatMap((provider) =>
+    const candidates = this.selectableProviders().flatMap((provider) =>
       provider.models
         .filter((model) => model.modelId === value)
         .map((model) => ({ providerId: provider.providerId, model })),
@@ -3681,12 +5388,18 @@ export class AxlApp {
   private async applyConfigurationCommand(input: string): Promise<void> {
     const command = input.slice(1).split(/\s/u, 1)[0] ?? "";
     const argument = input.slice(command.length + 2).trim() || undefined;
-    const outcome = await this.commandController.invoke(input, this.sessionId, {
-      ...(this.sessionSubscription?.projector.overview.requestSettings === undefined
-        ? {}
-        : { requestSettings: this.sessionSubscription.projector.overview.requestSettings }),
-    });
-    await this.handleCommandOutcome(command, argument, outcome);
+    try {
+      const outcome = await this.commandController.invoke(input, this.sessionId, {
+        ...(this.sessionSubscription?.projector.overview.requestSettings === undefined
+          ? {}
+          : { requestSettings: this.sessionSubscription.projector.overview.requestSettings }),
+      });
+      await this.handleCommandOutcome(command, argument, outcome);
+    } catch (error) {
+      // Most callers are picker callbacks that cannot await this, so a
+      // rejection here would end the process instead of reaching the user.
+      this.notice = this.view.palette.error(`✖ ${providerErrorText(error)}`);
+    }
     this.redraw();
   }
 
@@ -3714,19 +5427,38 @@ export class AxlApp {
       this.redraw();
       return;
     }
-    const selections = this.providerInventory.flatMap((provider) =>
+    const selections = this.selectableProviders().flatMap((provider) =>
       provider.models.map((model) => ({ provider, model })),
     );
     if (modelId) {
       const selected = this.modelSelection(modelId);
       if (selected === undefined) {
-        this.notice = this.view.palette.error(`✖ unknown or ambiguous model ${modelId}`);
+        const loggedOut = this.providerInventory.find(
+          (provider) =>
+            provider.authentication.phase !== "authenticated" &&
+            provider.models.some(
+              (model) =>
+                modelId === `${provider.providerId}/${model.modelId}` || modelId === model.modelId,
+            ),
+        );
+        this.notice = this.view.palette.error(
+          loggedOut === undefined
+            ? `✖ unknown or ambiguous model ${modelId}`
+            : `✖ ${loggedOut.displayName} is not logged in. Use /login ${loggedOut.providerId}`,
+        );
         this.redraw();
         return;
       }
       await this.applyConfigurationCommand(
         `/model ${selected.providerId}/${selected.model.modelId}`,
       );
+      return;
+    }
+    if (selections.length === 0) {
+      this.notice = this.view.palette.error(
+        "✖ No models available. Use /login to configure a provider",
+      );
+      this.redraw();
       return;
     }
     const favorites = new Set(this.modelFavorites);
@@ -4231,6 +5963,68 @@ export class AxlApp {
     this.redraw();
   }
 
+  private async replaceTerminalExtensions(client: AxlClient, sessionId: SessionId): Promise<void> {
+    const definitions = [
+      ...(this.options.extensions ?? []),
+      ...(this.options.loadExtensions === undefined
+        ? []
+        : await this.options.loadExtensions(client, sessionId)),
+    ];
+    const replacement = new TerminalExtensionHost(definitions, {
+      uiFor: (signal) => this.extensionCommandContext(signal),
+      initiallyInactiveExtensionIds: this.loungeEnabled ? [] : this.loungeExtensionIds,
+    });
+    await replacement.activate();
+    try {
+      const conflict = replacement
+        .shortcuts()
+        .find((shortcut) => isReservedExtensionShortcut(shortcut.key));
+      if (conflict !== undefined)
+        throw new Error(
+          `Extension ${conflict.extensionId} conflicts with a reserved terminal shortcut`,
+        );
+      const previousIds = new Set(this.extensionHost.extensionStates().map((state) => state.id));
+      const names = new Set(
+        this.commandController.commands
+          .filter(
+            (command) =>
+              command.source !== "presentation" ||
+              command.extensionId === undefined ||
+              !previousIds.has(command.extensionId),
+          )
+          .flatMap((command) => [command.name, ...command.aliases]),
+      );
+      for (const command of replacement.commands()) {
+        if (names.has(command.name)) throw new Error(`Command name collision: /${command.name}`);
+      }
+    } catch (error) {
+      await replacement.dispose();
+      throw error;
+    }
+    for (const controller of this.extensionCommandControllers) controller.abort();
+    this.extensionCommandControllers.clear();
+    this.extensionCompletionRequest?.controller.abort();
+    this.extensionCompletionRequest = undefined;
+    this.extensionCompletionResult = undefined;
+    // Disposing the previous host disposes its activity instances, so close the surface first.
+    await this.activitySurface.reset();
+    const previous = this.extensionHost;
+    this.extensionHost = replacement;
+    this.extensionWidgetsAbove = new ExtensionWidgetsComponent(
+      replacement,
+      "aboveEditor",
+      () => this.view.palette,
+    );
+    this.extensionWidgetsBelow = new ExtensionWidgetsComponent(
+      replacement,
+      "belowEditor",
+      () => this.view.palette,
+    );
+    await previous.dispose();
+    this.liveAssistant.invalidate();
+    if (!this.hydrating) this.rebuildTranscript();
+  }
+
   private async switchSession(
     opened: SessionOpenResult,
     draft: string,
@@ -4263,12 +6057,16 @@ export class AxlApp {
 
     const previousSubscription = this.sessionSubscription;
     try {
+      if (this.options.loadExtensions !== undefined)
+        await this.replaceTerminalExtensions(client, opened.sessionId);
       await previousSubscription?.close();
     } catch (error) {
       await nextSubscription.close().catch(() => undefined);
       throw error;
     }
     this.reconnectGeneration += 1;
+    await this.activitySurface.reset();
+    this.attentionOverlay.clear();
     if (client !== this.client) this.bindClient(client);
     this.connectionState = "connected";
     if (this.tuiMode === "regular") this.options.output.write(this.screen.clear());
@@ -4281,6 +6079,8 @@ export class AxlApp {
     this.seenEventIds.clear();
     this.transcript.length = 0;
     this.document.clear();
+    this.recentActivityTools.length = 0;
+    this.observedActivityFiles.clear();
     this.toolGroupModes.clear();
     this.toolTransactions.replace(
       new ToolTransactionStore(
@@ -4308,6 +6108,8 @@ export class AxlApp {
       this.options.modelCatalog,
       (reference, mediaWidth, mediaPalette) =>
         this.mediaCache.rows(reference, mediaWidth, this.tuiMode === "fullscreen", mediaPalette),
+      undefined,
+      () => this.extensionHost,
     );
     this.view.thinkingDisplay = thinkingDisplay;
     this.view.toolOutputDisplay = toolOutputDisplay;
@@ -4349,33 +6151,35 @@ export class AxlApp {
     readonly onCancel?: () => void;
     readonly onHighlight?: (value: string) => void;
     readonly preview?: (width: number) => readonly string[];
-  }): void {
+  }): PickerOverlay {
     const close = (): void => {
-      this.overlays.close();
+      if (this.overlays.active === overlay) this.overlays.close();
       this.openNextInteraction();
     };
-    this.overlays.replace(
-      new PickerOverlay({
-        ...input,
-        palette: () => this.view.palette,
-        onPick: (value) => {
-          close();
-          input.onPick(value);
-        },
-        onCancel: () => {
-          input.onCancel?.();
-          close();
-        },
-      }),
-    );
+    const overlay = new PickerOverlay({
+      ...input,
+      palette: () => this.view.palette,
+      onPick: (value) => {
+        close();
+        input.onPick(value);
+      },
+      onCancel: () => {
+        input.onCancel?.();
+        close();
+      },
+    });
+    this.overlays.replace(overlay);
+    return overlay;
   }
 
   private openNextInteraction(): void {
-    if (this.overlays.active !== undefined || this.interactionQueue.length === 0) return;
+    if (this.attentionOverlay.active !== undefined || this.interactionQueue.length === 0) return;
+    this.activitySurface.suspend("attention");
     const request = this.interactionQueue.shift() as EventPayloadMap["interaction.requested"];
     this.activeInteractionId = request.interactionId;
     this.interactionError = undefined;
-    if (request.kind === "mcp_elicitation_form") this.openInteractionForm(request);
+    if (request.kind === "user_question") this.openUserQuestions(request);
+    else if (request.kind === "mcp_elicitation_form") this.openInteractionForm(request);
     else this.openInteractionApproval(request);
   }
 
@@ -4446,7 +6250,38 @@ export class AxlApp {
         }
       },
     };
-    this.overlays.replace(modal);
+    this.attentionOverlay.replace(modal);
+  }
+
+  private openUserQuestions(
+    request: EventPayloadMap["interaction.requested"],
+    respond: (
+      interactionId: string,
+      action: "accept" | "decline" | "cancel",
+      content?: JsonObject,
+    ) => Promise<boolean> = (interactionId, action, content) =>
+      this.respondToInteraction(interactionId, action, content),
+  ): void {
+    const questions = Array.isArray(request.data?.questions)
+      ? parseUserQuestionRequest({ questions: request.data.questions }).questions
+      : [];
+    const dialog = new QuestionnaireOverlay({
+      questions,
+      palette: () => this.view.palette,
+      refresh: () => this.redraw(),
+      submit: async (answers) => {
+        if (!(await respond(request.interactionId, "accept", { answers }))) {
+          throw new Error(this.interactionError ?? "Could not submit answers");
+        }
+      },
+      cancel: async () => {
+        if (!(await respond(request.interactionId, "cancel"))) {
+          throw new Error(this.interactionError ?? "Could not cancel questionnaire");
+        }
+      },
+    });
+    this.attentionOverlay.replace(dialog);
+    this.redraw();
   }
 
   private openInteractionForm(request: EventPayloadMap["interaction.requested"]): void {
@@ -4466,7 +6301,7 @@ export class AxlApp {
       cancel: () => controller.abort(),
       refresh: () => this.redraw(),
     });
-    this.overlays.replace(dialog);
+    this.attentionOverlay.replace(dialog);
     this.redraw();
     void this.collectInteractionForm(request, schema, dialog, controller.signal);
   }
@@ -4757,7 +6592,7 @@ export class AxlApp {
       if (resolved && this.activeInteractionId === interactionId) {
         this.activeInteractionId = undefined;
         this.interactionError = undefined;
-        this.overlays.close();
+        this.attentionOverlay.clear();
         this.openNextInteraction();
       }
       this.redraw();
@@ -5116,6 +6951,8 @@ export class AxlApp {
     diffLayout?: DiffLayout;
     workspaceReview?: boolean;
     imageDisplay?: ImageDisplay;
+    mascot?: boolean;
+    mascotColour?: string;
   }): Promise<void> {
     try {
       await this.options.onPreferenceChange?.(update);
@@ -5391,14 +7228,19 @@ export class AxlApp {
     this.activeRequest = "compaction";
     this.awaitingOperationOwnership = true;
     this.setWorking(true);
+    this.mascotDirector?.compactionStarted();
     this.notice = undefined;
     this.redraw();
     try {
-      await this.commandController.invoke(
+      const outcome = await this.commandController.invoke(
         `/compact${instructions === undefined ? "" : ` ${instructions}`}`,
         this.sessionId,
       );
-      this.notice = undefined;
+      this.awaitingOperationOwnership = false;
+      this.notice =
+        outcome.state === "queued"
+          ? this.view.palette.dim("· /compact queued after the active response")
+          : undefined;
     } catch (error) {
       this.awaitingOperationOwnership = false;
       this.notice = this.view.palette.error(
@@ -5411,18 +7253,33 @@ export class AxlApp {
         this.awaitingOperationOwnership ||
           this.sessionSubscription?.projector.overview.activeOperationId !== undefined,
       );
+      // context.compacted normally ends it first; a failed or queued
+      // compaction has no such event and would leave the mascot curled up
+      this.mascotDirector?.compactionFinished();
       this.redraw();
       void this.drainQueue();
     }
   }
 
   private async reload(): Promise<void> {
+    this.extensionReloading = true;
     try {
       await this.commandController.invoke("/reload", this.sessionId);
-      for (const controller of this.extensionCommandControllers) controller.abort();
-      this.extensionCommandControllers.clear();
+      this.attentionOverlay.clear();
       this.overlays.clear();
-      await this.extensionHost.reload();
+      await this.activitySurface.reset();
+      if (this.options.loadExtensions === undefined) {
+        for (const controller of this.extensionCommandControllers) controller.abort();
+        this.extensionCommandControllers.clear();
+        this.extensionCompletionRequest?.controller.abort();
+        this.extensionCompletionRequest = undefined;
+        this.extensionCompletionResult = undefined;
+        await this.extensionHost.reload();
+        this.liveAssistant.invalidate();
+      } else {
+        await this.commandController.refresh(this.sessionId);
+        await this.replaceTerminalExtensions(this.client, this.sessionId);
+      }
       try {
         void this.commandController.commands;
       } catch (error) {
@@ -5437,6 +7294,8 @@ export class AxlApp {
         `✖ ${error instanceof Error ? error.message : "reload failed"}`,
       );
       this.redraw();
+    } finally {
+      this.extensionReloading = false;
     }
   }
 }

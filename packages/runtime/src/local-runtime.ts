@@ -2,21 +2,27 @@
 // SPDX-FileCopyrightText: 2026 Kaushik Kumar
 // SPDX-FileCopyrightText: 2026 Lokesh
 // SPDX-FileCopyrightText: 2026 Srihari
+// SPDX-FileCopyrightText: 2026 Shaan Narendran
 // SPDX-License-Identifier: Apache-2.0
 
 import { access, readdir } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
-import type { CredentialStore } from "@axl/ai";
+import type { CredentialStore, ModelProvider } from "@axl/ai";
 import { type AxlDaemon, listStoredSessions } from "@axl/daemon";
 import {
+  type CompactionPreferences,
   DEFAULT_MODEL_REQUEST_SETTINGS,
   type ModelRequestSettings,
   parseModelRequestSettings,
+  resolveCompactionSettings,
   type SessionSummary,
   type ThinkingLevel,
+  WIRE_CAPABILITIES,
 } from "@axl/protocol";
 
+import { extensionDiagnosticsExtension } from "./core-daemon-extension.ts";
+import { startModelsDevAutoRefresh } from "./models-dev-auto-refresh.ts";
 import {
   createProviderManagementService,
   type TrustedProviderLoginAdapter,
@@ -26,6 +32,7 @@ import {
 export interface LocalRuntimeDefaults {
   readonly providerId?: string;
   readonly requestSettings?: ModelRequestSettings;
+  readonly compaction?: CompactionPreferences;
   readonly modelId: string;
   readonly thinkingLevel: ThinkingLevel;
   readonly webFetch?: boolean;
@@ -67,6 +74,16 @@ export type LocalSessionPlacement =
 export interface LocalSessionDescriptor extends SessionSummary {
   readonly placement: LocalSessionPlacement;
   readonly placementLabel: string;
+}
+
+async function exists(path: string): Promise<boolean> {
+  try {
+    await access(path);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
 }
 
 async function directories(path: string): Promise<readonly string[]> {
@@ -167,16 +184,6 @@ async function migrateLegacyAzureCredential(store: CredentialStore): Promise<voi
   await store.delete(legacyProviderId);
 }
 
-async function exists(path: string): Promise<boolean> {
-  try {
-    await access(path);
-    return true;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-    throw error;
-  }
-}
-
 export async function loginProviderFromTrustedHost(input: {
   readonly store: CredentialStore;
   readonly adapter: TrustedProviderLoginAdapter;
@@ -231,6 +238,12 @@ export interface LocalDaemonOptions {
   readonly store: CredentialStore;
   readonly unsafe: boolean;
   readonly sandbox?: LocalSandboxSelection;
+  /** Defaults to a background startup and daily refresh. Use false for explicitly offline hosts. */
+  readonly modelsDevAutoRefresh?: {
+    readonly enabled?: boolean;
+    readonly intervalMs?: number;
+    readonly fetch?: typeof fetch;
+  };
 }
 
 /**
@@ -238,6 +251,13 @@ export interface LocalDaemonOptions {
  * extensions, policy, and sandbox without depending on a presentation client.
  */
 export async function startLocalDaemon(options: LocalDaemonOptions): Promise<AxlDaemon> {
+  const intervalMs = options.modelsDevAutoRefresh?.intervalMs;
+  if (
+    intervalMs !== undefined &&
+    (!Number.isSafeInteger(intervalMs) || intervalMs < 1 || intervalMs > 2_147_483_647)
+  ) {
+    throw new TypeError("models.dev refresh interval must be between 1 and 2147483647 ms");
+  }
   const { axlHome, stateDirectory, socketPath, defaults, store, unsafe } = options;
   const sandboxSelection = options.sandbox ?? { type: "native" as const };
   let assemblyPromise:
@@ -246,8 +266,14 @@ export async function startLocalDaemon(options: LocalDaemonOptions): Promise<Axl
         kernel: typeof import("@axl/kernel");
         sandbox: import("@axl/sandbox").PlatformSandbox;
         providers: import("@axl/ai").ProviderRegistry;
+        modelsDevProviderIds: readonly string[];
+        readModelsDevCatalog: import("@axl/ai").ModelsDevCatalogReader;
       }>
     | undefined;
+  const extensionProviders = new Map<
+    string,
+    { readonly extensionId: string; references: number; readonly unregister: () => Promise<void> }
+  >();
   const loadAssembly = () => {
     assemblyPromise ??= Promise.all([
       import("@axl/ai"),
@@ -273,12 +299,23 @@ export async function startLocalDaemon(options: LocalDaemonOptions): Promise<Axl
         store,
         context: ai.nodeAuthContext,
       });
-      for (const provider of ai.createBuiltinProviders({ store, context: ai.nodeAuthContext })) {
-        if (!configured.some((entry) => entry.id === provider.id)) providers.register(provider);
+      const modelsDevIds = new Set(ai.modelsDevProviderIds());
+      const modelsDevProviderIds: string[] = [];
+      const readModelsDevCatalog = ai.createModelsDevCatalogReader(
+        options.modelsDevAutoRefresh?.fetch,
+      );
+      for (const provider of ai.createBuiltinProviders(
+        { store, context: ai.nodeAuthContext },
+        undefined,
+        readModelsDevCatalog,
+      )) {
+        if (configured.some((entry) => entry.id === provider.id)) continue;
+        providers.register(provider);
+        if (modelsDevIds.has(provider.id)) modelsDevProviderIds.push(provider.id);
       }
       for (const provider of configured) providers.register(provider);
-      const restored = await providers.restoreCatalogs();
-      return { ai, kernel, sandbox, providers, catalogErrors: restored.errors };
+      await providers.restoreCatalogs();
+      return { ai, kernel, sandbox, providers, modelsDevProviderIds, readModelsDevCatalog };
     });
     return assemblyPromise;
   };
@@ -286,13 +323,85 @@ export async function startLocalDaemon(options: LocalDaemonOptions): Promise<Axl
   // Sandboxed startup fails closed before listening. Unsafe startup may listen
   // first because its lack of isolation is already explicit and logged.
   const initialAssembly = unsafe ? undefined : await loadAssembly();
-  const { AxlDaemon } = await import("@axl/daemon");
+  const { AxlDaemon, commandCatalog, installDaemonCommandCapabilities, McpProbeFailedError } =
+    await import("@axl/daemon");
+  const reservedCommandNames = new Set(
+    commandCatalog(new Set(WIRE_CAPABILITIES)).commands.map((command) => command.name),
+  );
+  const { DaemonExtensionRegistry } = await import("@axl/extension-host");
+  const extensionRegistry = new DaemonExtensionRegistry(axlHome, undefined, [
+    "axl.prompt-templates",
+    "axl.skills",
+  ]);
+  const {
+    McpConfigStore,
+    mcpCapabilityCachePath,
+    mcpDiscoveryStateReader,
+    McpProbeError,
+    mcpSecretValues: mcpSecretValuesOf,
+    probeMcpServer,
+    resolveMcpServerConfig,
+  } = await import("@axl/extension-mcp");
+  const mcpCachePath = mcpCapabilityCachePath(axlHome);
+  const mcpConfigurationStore = new McpConfigStore(
+    axlHome,
+    process.cwd(),
+    mcpDiscoveryStateReader(mcpCachePath),
+  );
+  const probeMcpConfiguration = async (
+    params: import("@axl/protocol").McpConfigProbeParams,
+    signal?: AbortSignal,
+  ): Promise<import("@axl/protocol").McpConfigProbeResult> => {
+    const { sandbox } = await loadAssembly();
+    const cwd = process.cwd();
+    let server: import("@axl/extension-mcp").NamedMcpServerConfig;
+    try {
+      server = resolveMcpServerConfig(params.name, params.definition, cwd);
+    } catch (error) {
+      throw new McpProbeFailedError(
+        params.name,
+        error instanceof Error ? error.message : "Invalid MCP server definition",
+        { cause: error },
+      );
+    }
+    const policy = { workspace: cwd, readableRoots: [cwd], protectedPaths: [axlHome] };
+    try {
+      return await probeMcpServer({
+        server,
+        cwd,
+        stateDirectory: join(stateDirectory, "mcp-probe"),
+        blobDirectory: join(stateDirectory, "blobs"),
+        secretValues: mcpSecretValuesOf([server]),
+        wrapStdio: (input) => sandbox.wrapProcess({ ...input, policy }),
+        cachePath: mcpCachePath,
+        ...(signal === undefined ? {} : { signal }),
+      });
+    } catch (error) {
+      if (error instanceof McpProbeError) {
+        throw new McpProbeFailedError(params.name, error.message, { cause: error });
+      }
+      throw error;
+    }
+  };
+  const refreshLifecycle = new AbortController();
+  let refreshStartup: Promise<void> | undefined;
+  let autoRefresh: ReturnType<typeof startModelsDevAutoRefresh> | undefined;
+  let explicitRefreshes = 0;
   const providerManagement = {
     list: async (...args: Parameters<import("@axl/daemon").ProviderManagementService["list"]>) =>
       createProviderManagementService((await loadAssembly()).providers).list(...args),
     refresh: async (
       ...args: Parameters<import("@axl/daemon").ProviderManagementService["refresh"]>
-    ) => createProviderManagementService((await loadAssembly()).providers).refresh(...args),
+    ) => {
+      explicitRefreshes += 1;
+      try {
+        return await createProviderManagementService((await loadAssembly()).providers).refresh(
+          ...args,
+        );
+      } finally {
+        explicitRefreshes -= 1;
+      }
+    },
     authenticationStatus: async (
       ...args: Parameters<import("@axl/daemon").ProviderManagementService["authenticationStatus"]>
     ) =>
@@ -305,10 +414,14 @@ export async function startLocalDaemon(options: LocalDaemonOptions): Promise<Axl
       ...args: Parameters<import("@axl/daemon").ProviderManagementService["logout"]>
     ) => createProviderManagementService((await loadAssembly()).providers).logout(...args),
     dispose: async () => {
+      refreshLifecycle.abort();
+      await refreshStartup;
+      await autoRefresh?.dispose();
       if (assemblyPromise !== undefined) await (await assemblyPromise).providers.dispose();
     },
   } satisfies import("@axl/daemon").ProviderManagementService;
-  const daemon = new AxlDaemon({
+  let daemon: AxlDaemon;
+  daemon = new AxlDaemon({
     ...(options.buildVersion === undefined ? {} : { buildVersion: options.buildVersion }),
     ...(options.onStopped === undefined ? {} : { onStopped: options.onStopped }),
     ...(options.forceTerminate === undefined ? {} : { forceTerminate: options.forceTerminate }),
@@ -318,48 +431,56 @@ export async function startLocalDaemon(options: LocalDaemonOptions): Promise<Axl
     sandboxProvider: unsafe ? "none" : (initialAssembly?.sandbox.provider ?? "unknown"),
     ...(sandboxSelection.type === "oci" ? { sandboxImage: sandboxSelection.image } : {}),
     providerManagement,
-    runtime: async ({ sessionId, cwd, boundary, selection, interact, readBlob }) => {
+    mcpConfiguration: {
+      list: () => mcpConfigurationStore.list(),
+      upsert: ({ name, definition }) => mcpConfigurationStore.upsert(name, definition),
+      batch: ({ servers }) => mcpConfigurationStore.upsertMany(servers),
+      remove: ({ name }) => mcpConfigurationStore.remove(name),
+      probe: probeMcpConfiguration,
+    },
+    extensionManagement: {
+      list: (cwd) => extensionRegistry.list(cwd),
+      setEnabled: (extensionId, enabled) => extensionRegistry.setEnabled(extensionId, enabled),
+      install: (source, signal) => extensionRegistry.install(source, signal),
+      update: (extensionId, signal) => extensionRegistry.update(extensionId, signal),
+      remove: (extensionId, signal) => extensionRegistry.remove(extensionId, signal),
+      trustProject: (path, trusted) => extensionRegistry.trustProject(path, trusted),
+    },
+    runtime: async ({
+      sessionId,
+      cwd,
+      boundary,
+      selection,
+      signal,
+      contextResources,
+      interact,
+      compact,
+      reload,
+      extensionSession,
+      readBlob,
+    }) => {
       const { ai, kernel, sandbox, providers } = await loadAssembly();
       const profile = selection.profile ?? "standard";
-      const [hasMcpConfig, hasSkills] =
-        profile !== "standard"
-          ? [false, false]
-          : await Promise.all([
-              Promise.all([
-                exists(join(axlHome, "mcp.json")),
-                exists(join(cwd, ".axl", "mcp.json")),
-              ]).then((values) => values.some(Boolean)),
-              Promise.all([
-                exists(join(axlHome, "skills")),
-                exists(join(cwd, ".axl", "skills")),
-              ]).then((values) => values.some(Boolean)),
-            ]);
-      const [mcpPackage, skillsPackage] = await Promise.all([
-        hasMcpConfig ? import("@axl/extension-mcp") : Promise.resolve(undefined),
-        hasSkills ? import("@axl/extension-skills") : Promise.resolve(undefined),
-      ]);
-      const [instructions, skills, mcpServers] = await Promise.all([
-        kernel.loadAgentsInstructions({ cwd, globalPath: join(axlHome, "AGENTS.md") }),
-        skillsPackage === undefined
-          ? Promise.resolve([])
-          : skillsPackage.discoverSkills({ cwd, globalDirectory: join(axlHome, "skills") }),
-        mcpPackage === undefined
-          ? Promise.resolve([])
-          : mcpPackage.loadMcpConfig({ cwd, globalDirectory: axlHome }),
-      ]);
+      let resources =
+        contextResources ??
+        (await kernel.loadAgentsResources({
+          cwd,
+          globalPath: join(axlHome, "AGENTS.md"),
+        }));
+      let instructions = kernel.agentsInstructionsFromResources(resources);
       const active = {
         providerId: selection.providerId ?? defaults.providerId ?? "azure-openai-responses",
         modelId: selection.modelId ?? defaults.modelId,
         thinkingLevel: selection.thinkingLevel ?? defaults.thinkingLevel,
         webFetch: profile === "standard" && (selection.webFetch ?? defaults.webFetch ?? true),
         webSearch: profile === "standard" && (selection.webSearch ?? defaults.webSearch ?? true),
+        userQuestions: profile === "standard" && (selection.userQuestions ?? false),
       };
-      const modelInfo = await validateProviderSelection(
-        providers,
+      const compaction = resolveCompactionSettings(
+        defaults.compaction,
         active.providerId,
         active.modelId,
       );
-      const thinking = ai.clampThinkingLevel(modelInfo, active.thinkingLevel);
       const policy = {
         workspace: cwd,
         readableRoots: [cwd],
@@ -369,16 +490,36 @@ export async function startLocalDaemon(options: LocalDaemonOptions): Promise<Axl
         selection.requestSettings ?? defaults.requestSettings ?? DEFAULT_MODEL_REQUEST_SETTINGS,
       );
       const providerSecrets = new Set<string>();
-      const model = ai.modelPortForRegistry(providers, {
-        providerId: active.providerId,
-        requestSettings,
-        modelId: active.modelId,
-        thinkingLevel: thinking.effective,
-        readBlob,
-        onResolvedSecrets: (values) => {
-          for (const value of values) providerSecrets.add(value);
-        },
-      });
+      let extensionHost: import("@axl/kernel").ExtensionHost | undefined;
+      let capabilityService: import("@axl/kernel").CapabilityService | undefined;
+      const resolveModel = async () => {
+        const modelInfo = await validateProviderSelection(
+          providers,
+          active.providerId,
+          active.modelId,
+        );
+        const thinking = ai.clampThinkingLevel(modelInfo, active.thinkingLevel);
+        const model = ai.modelPortForRegistry(providers, {
+          providerId: active.providerId,
+          requestSettings,
+          modelId: active.modelId,
+          thinkingLevel: thinking.effective,
+          readBlob,
+          onResolvedSecrets: (values) => {
+            for (const value of values) providerSecrets.add(value);
+          },
+          providerHooks: {
+            beforeHeaders: (input, requestSignal) =>
+              extensionHost?.beforeProviderHeaders?.(input, requestSignal) ?? input.headers,
+            beforeRequest: (input, requestSignal) =>
+              extensionHost?.beforeProviderRequest?.(input, requestSignal) ?? input.payload,
+            afterResponse: (input, requestSignal) =>
+              extensionHost?.afterProviderResponse?.(input, requestSignal),
+          },
+        });
+        return { model, modelInfo, thinking };
+      };
+      let selectedModel: Awaited<ReturnType<typeof resolveModel>> | undefined;
       const tools = new kernel.ToolRegistry();
       const overflowDirectory = join(stateDirectory, "tool-output", sessionId);
       if (profile !== "chat") {
@@ -402,61 +543,252 @@ export async function startLocalDaemon(options: LocalDaemonOptions): Promise<Axl
           }),
         );
       }
-
-      if (skillsPackage !== undefined && skills.length > 0) {
-        tools.register(skillsPackage.makeSkillTool(skills));
+      if (active.userQuestions) tools.register(kernel.makeAskUserQuestionTool(interact));
+      const mcpSecrets = new Set<string>();
+      if (profile === "standard") {
+        const { discoverSkills, SkillCapabilityService } = await import("@axl/extension-skills");
+        const skills = await discoverSkills({
+          cwd,
+          globalDirectories: [join(axlHome, "skills"), join(dirname(axlHome), ".agents", "skills")],
+        });
+        const daemonCapabilities = installDaemonCommandCapabilities({
+          tools,
+          compact,
+          reload,
+          mcp: {
+            list: () => mcpConfigurationStore.list(),
+            upsert: (name, definition) => mcpConfigurationStore.upsert(name, definition),
+            remove: (name) => mcpConfigurationStore.remove(name),
+          },
+        });
+        const { DAEMON_EXTENSION_AUTHORITY, loadDaemonExtensions } = await import(
+          "@axl/extension-host"
+        );
+        const grantedAuthorities = new Set([
+          "skills.activate",
+          DAEMON_EXTENSION_AUTHORITY,
+          ...daemonCapabilities.grantedAuthorities,
+        ]);
+        const skillService = new SkillCapabilityService(skills, { grantedAuthorities });
+        const extensionEntries = await extensionRegistry.entries(cwd);
+        let daemonExtensions: Awaited<ReturnType<typeof loadDaemonExtensions>>;
+        try {
+          daemonExtensions = await loadDaemonExtensions({
+            directory: join(axlHome, "extensions"),
+            extensions: extensionEntries,
+            builtinExtensions: [
+              {
+                id: "axl-core",
+                path: "builtin:extension-diagnostics",
+                source: "builtin",
+                factory: extensionDiagnosticsExtension,
+              },
+            ],
+            cwd,
+            reason: boundary,
+            tools,
+            grantedAuthorities,
+            signal,
+            session: {
+              ...extensionSession,
+              extensions: async () => {
+                const extensions = await extensionRegistry.list(cwd);
+                return { extensions: extensions.extensions };
+              },
+              info: async () => {
+                const [info, catalog, extensions] = await Promise.all([
+                  extensionSession.info(),
+                  providers.listModels(),
+                  extensionRegistry.list(cwd),
+                ]);
+                return {
+                  ...info,
+                  models: catalog.models.map(({ providerId, modelId }) => ({
+                    providerId,
+                    modelId,
+                  })),
+                  projectTrusted: extensions.project.trusted,
+                };
+              },
+            },
+            shutdown: async () => {
+              setTimeout(() => void daemon.stop(), 0);
+            },
+            registerProvider: (extensionId, value) => {
+              const provider = value as Partial<ModelProvider>;
+              if (
+                typeof provider.id !== "string" ||
+                typeof provider.displayName !== "string" ||
+                !Array.isArray(provider.authMethods) ||
+                typeof provider.listModels !== "function" ||
+                typeof provider.stream !== "function"
+              ) {
+                throw new TypeError("Extension provider does not implement ModelProvider");
+              }
+              const existing = extensionProviders.get(provider.id);
+              if (existing !== undefined) {
+                if (existing.extensionId !== extensionId) {
+                  throw new Error(
+                    `Provider ${provider.id} is already owned by extension ${existing.extensionId}`,
+                  );
+                }
+                existing.references += 1;
+              } else {
+                extensionProviders.set(provider.id, {
+                  extensionId,
+                  references: 1,
+                  unregister: providers.register(provider as ModelProvider),
+                });
+              }
+              return async () => {
+                const registered = extensionProviders.get(provider.id as string);
+                if (registered === undefined || registered.extensionId !== extensionId) return;
+                registered.references -= 1;
+                if (registered.references > 0) return;
+                extensionProviders.delete(provider.id as string);
+                await registered.unregister();
+              };
+            },
+            reservedCommandNames,
+            onFailure: (failure) => {
+              extensionRegistry.recordFailure(failure.extensionId, failure.error);
+              console.error(
+                `Axl extension ${failure.extensionId} ${failure.event} handler failed: ${failure.error.message}`,
+              );
+            },
+          });
+        } catch (error) {
+          if (error instanceof kernel.ExtensionHostError) {
+            const extensionId = error.details.extensionId;
+            if (typeof extensionId === "string")
+              extensionRegistry.recordFailure(extensionId, error);
+          }
+          throw error;
+        }
+        for (const extension of daemonExtensions.extensions) {
+          extensionRegistry.clearFailure(extension.id);
+        }
+        const hosts: import("@axl/kernel").ExtensionHost[] = [daemonExtensions.host];
+        try {
+          const extensionResources =
+            contextResources === undefined
+              ? ((await daemonExtensions.host.discoverResources?.(signal)) ?? [])
+              : [];
+          if (extensionResources.length > 0) {
+            resources = [...resources, ...extensionResources];
+            instructions = kernel.agentsInstructionsFromResources(resources);
+          }
+          selectedModel = await resolveModel();
+          const capabilitySources: import("@axl/kernel").CapabilitySource[] = [
+            { records: skillService.records, service: skillService },
+            daemonCapabilities.source,
+            daemonExtensions.source,
+          ];
+          if (await exists(join(axlHome, "mcp.json"))) {
+            const { loadMcpCapabilities, loadMcpConfig, McpManager, updateMcpCapabilityCache } =
+              await import("@axl/extension-mcp");
+            const servers = await loadMcpConfig({ cwd, globalDirectory: axlHome });
+            for (const value of mcpSecretValuesOf(servers)) mcpSecrets.add(value);
+            if (servers.length > 0) {
+              const cachePath = mcpCachePath;
+              const manager = new McpManager({
+                servers,
+                cwd,
+                sessionId,
+                stateDirectory: join(stateDirectory, "mcp"),
+                blobDirectory: join(stateDirectory, "blobs"),
+                model: selectedModel.model,
+                modelId: active.modelId,
+                secretValues: [...mcpSecrets],
+                onSecrets: (values) => {
+                  for (const value of values) mcpSecrets.add(value);
+                },
+                onToolListChanged: (server, discovery) =>
+                  updateMcpCapabilityCache({ cachePath, server, discovery }),
+                interact: async (request, signal) => {
+                  const response = await interact(request, signal);
+                  if (
+                    response.action !== "accept" &&
+                    response.action !== "decline" &&
+                    response.action !== "cancel"
+                  ) {
+                    throw new Error(`Unsupported MCP interaction response ${response.action}`);
+                  }
+                  return {
+                    action: response.action,
+                    ...(response.content ? { content: response.content } : {}),
+                  };
+                },
+                wrapStdio: (input) => sandbox.wrapProcess({ ...input, policy }),
+              });
+              hosts.push(manager);
+              const mcp = await loadMcpCapabilities({
+                servers,
+                manager,
+                tools,
+                cachePath,
+              });
+              grantedAuthorities.add(mcp.authority);
+              capabilitySources.push({ records: mcp.service.records, service: mcp.service });
+            }
+          }
+          extensionHost = kernel.composeExtensionHosts(hosts);
+          capabilityService = new kernel.CompositeCapabilityService(
+            capabilitySources,
+            grantedAuthorities,
+          );
+          tools.register(kernel.makeCapabilitySearchTool(capabilityService));
+        } catch (error) {
+          await Promise.allSettled([...hosts].reverse().map((host) => host.dispose()));
+          throw error;
+        }
       }
-      const mcpSecrets = mcpPackage?.mcpSecretValues(mcpServers) ?? [];
-      const mcp =
-        mcpPackage === undefined || mcpServers.length === 0
-          ? undefined
-          : new mcpPackage.McpManager({
-              servers: mcpServers,
-              cwd,
-              sessionId,
-              stateDirectory: join(stateDirectory, "mcp"),
-              blobDirectory: join(stateDirectory, "blobs"),
-              model,
-              modelId: active.modelId,
-              secretValues: mcpSecrets,
-              interact,
-              wrapStdio: (input) => sandbox.wrapProcess({ policy, ...input }),
-            });
-      if (mcp) tools.register(mcp.makeTool());
 
-      const skillSection = skillsPackage?.skillCatalogSection(skills);
+      selectedModel ??= await resolveModel();
+      const { model, modelInfo, thinking } = selectedModel;
       const prompt = kernel.buildStablePrompt({
         cwd,
         tools: tools.declarations().map(({ name, description }) => ({ name, description })),
-        ...(unsafe
-          ? {
-              constraints: [
-                ...kernel.ESSENTIAL_CONSTRAINTS,
+        constraints: [
+          ...kernel.ESSENTIAL_CONSTRAINTS,
+          ...(unsafe
+            ? [
                 "No operating-system sandbox is active. Commands and file tools have the user's full host access.",
-              ],
-            }
-          : {}),
-        instructions: [...instructions, ...(skillSection === undefined ? [] : [skillSection])],
+              ]
+            : [
+                'Commands run inside an isolated sandbox that masks the host home directory and blocks network access. A missing executable or inaccessible host path means unavailable inside the sandbox, not absent from the host. A network failure such as "Could not resolve host" is caused by the sandbox, not by the user\'s connection. Say so and tell the user that restarting Axl with --unsafe lifts it.',
+              ]),
+        ],
+        instructions,
       });
       return {
         model,
         tools,
-        ...(mcp === undefined ? {} : { extensionHost: mcp }),
         prompt,
+        contextResources: resources,
+        compaction,
+        modelContextWindow: modelInfo.contextWindow,
         log: {
           secretValues: () => [
-            ...mcpSecrets,
             ...(braveSearchKey === undefined ? [] : [braveSearchKey]),
             ...providerSecrets,
+            ...mcpSecrets,
           ],
         },
+        ...(extensionHost === undefined ? {} : { extensionHost }),
+        ...(capabilityService === undefined ? {} : { capabilityService }),
         sandbox: sandbox.configuredPayload(),
         configProvider: { providerId: active.providerId },
         configModel: { modelId: active.modelId },
         configRequest: requestSettings,
+        configCompaction: compaction,
         configThinking: thinking,
         configProfile: { profile },
-        configTools: { webFetch: active.webFetch, webSearch: active.webSearch },
+        configTools: {
+          webFetch: active.webFetch,
+          webSearch: active.webSearch,
+          userQuestions: active.userQuestions,
+        },
         ...(boundary === "config_change"
           ? {}
           : {
@@ -469,5 +801,27 @@ export async function startLocalDaemon(options: LocalDaemonOptions): Promise<Axl
     },
   });
   await daemon.start();
+  if (options.modelsDevAutoRefresh?.enabled !== false) {
+    refreshStartup = (async () => {
+      try {
+        const { providers, modelsDevProviderIds, readModelsDevCatalog } = await loadAssembly();
+        if (refreshLifecycle.signal.aborted) return;
+        autoRefresh = startModelsDevAutoRefresh(providers, modelsDevProviderIds, {
+          ...(options.modelsDevAutoRefresh?.intervalMs === undefined
+            ? {}
+            : { intervalMs: options.modelsDevAutoRefresh.intervalMs }),
+          shouldRun: () => explicitRefreshes === 0,
+          withBatch: (signal, refresh) => readModelsDevCatalog.withBatch(signal, refresh),
+          onFailure: (message) => console.error(`Axl: ${message}`),
+        });
+      } catch (error) {
+        if (!refreshLifecycle.signal.aborted) {
+          console.error(
+            `Axl: could not start automatic models.dev refresh (${error instanceof Error ? error.name : "unknown error"})`,
+          );
+        }
+      }
+    })();
+  }
   return daemon;
 }

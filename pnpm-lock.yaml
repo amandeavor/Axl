@@ -4,6 +4,9 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+overrides:
+  fast-uri: 3.1.8
+
 importers:
 
   .:
@@ -56,9 +59,12 @@ importers:
       '@axl/daemon':
         specifier: workspace:*
         version: link:../daemon
-      '@axl/extension-mcp':
+      '@axl/extension-api':
         specifier: workspace:*
-        version: link:../extensions/mcp
+        version: link:../extensions/api
+      '@axl/extension-lounge':
+        specifier: workspace:*
+        version: link:../extensions/lounge
       '@axl/extension-prompts':
         specifier: workspace:*
         version: link:../extensions/prompts
@@ -103,11 +109,29 @@ importers:
 
   packages/extensions/api: {}
 
-  packages/extensions/mcp:
+  packages/extensions/host:
     dependencies:
       '@axl/extension-api':
         specifier: workspace:*
         version: link:../api
+      '@axl/kernel':
+        specifier: workspace:*
+        version: link:../../kernel
+      '@axl/protocol':
+        specifier: workspace:*
+        version: link:../../protocol
+      ajv:
+        specifier: 8.20.0
+        version: 8.20.0
+
+  packages/extensions/lounge:
+    dependencies:
+      '@axl/extension-api':
+        specifier: workspace:*
+        version: link:../api
+
+  packages/extensions/mcp:
+    dependencies:
       '@axl/kernel':
         specifier: workspace:*
         version: link:../../kernel
@@ -158,6 +182,9 @@ importers:
       '@axl/daemon':
         specifier: workspace:*
         version: link:../daemon
+      '@axl/extension-host':
+        specifier: workspace:*
+        version: link:../extensions/host
       '@axl/extension-mcp':
         specifier: workspace:*
         version: link:../extensions/mcp
@@ -220,9 +247,6 @@ importers:
       '@axl/daemon':
         specifier: workspace:*
         version: link:../daemon
-      '@axl/extension-mcp':
-        specifier: workspace:*
-        version: link:../extensions/mcp
       '@axl/extension-skills':
         specifier: workspace:*
         version: link:../extensions/skills
@@ -251,6 +275,12 @@ importers:
 
   packages/web:
     dependencies:
+      '@axl/extension-api':
+        specifier: workspace:*
+        version: link:../extensions/api
+      '@axl/extension-lounge':
+        specifier: workspace:*
+        version: link:../extensions/lounge
       '@axl/sdk':
         specifier: workspace:*
         version: link:../sdk
@@ -962,8 +992,8 @@ packages:
   fast-deep-equal@3.1.3:
     resolution: {integrity: sha512-f3qQ9oQy9j2AhBe/H9VC91wLmKBCCU/gDOnKNAYG5hswO7BLKj09Hc5HYNz9cGI++xlpDCIgDaitVs03ATR84Q==}
 
-  fast-uri@3.1.6:
-    resolution: {integrity: sha512-7Ical1vFEMr0onbVzEDIreM22I4khW+fzyQPwvAFWBp1iwdshSZRsL4jjRvPG9JP1uiqMHRto+YU6R2/CzDz5Q==}
+  fast-uri@3.1.8:
+    resolution: {integrity: sha512-GZMtZUTNRpOVIECoXwLNZS5xUGE+mVNbTB8h/7Rwh2TFWcBQiPzTgyZi05BF9UMZKkLJv8XBRJTlU7zg8+ZfMg==}
 
   fdir@6.5.0:
     resolution: {integrity: sha512-tIbYtZbucOs0BRGqPJkshJUYdL+SDH7dVM8gjy+ERp3WAUjLEFJE+02kanyHtwjWOnwrKYBiwAmM0p4kLJAnXg==}
@@ -2026,7 +2056,7 @@ snapshots:
   ajv@8.20.0:
     dependencies:
       fast-deep-equal: 3.1.3
-      fast-uri: 3.1.6
+      fast-uri: 3.1.8
       json-schema-traverse: 1.0.0
       require-from-string: 2.0.2
 
@@ -2216,7 +2246,7 @@ snapshots:
 
   fast-deep-equal@3.1.3: {}
 
-  fast-uri@3.1.6: {}
+  fast-uri@3.1.8: {}
 
   fdir@6.5.0(picomatch@4.0.7):
     optionalDependencies:

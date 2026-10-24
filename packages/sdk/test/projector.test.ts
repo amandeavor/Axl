@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Hari Srinivasan
 // SPDX-FileCopyrightText: 2026 VishnuM449
+// SPDX-FileCopyrightText: 2026 Shaan Narendran
 // SPDX-License-Identifier: Apache-2.0
 
 import assert from "node:assert/strict";
@@ -7,16 +8,16 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import {
+  type CanonicalEvent,
   ConversationProjector,
-  orderPendingTurnInputs,
   EVENT_FORMAT_VERSION,
+  type EventPayloadMap,
+  type EventType,
+  orderPendingTurnInputs,
   ProjectionError,
   parseEvent,
   parseOperationId,
   parseSessionId,
-  type CanonicalEvent,
-  type EventPayloadMap,
-  type EventType,
 } from "../src/index.ts";
 
 const sessionId = parseSessionId("123e4567-e89b-42d3-a456-426614174000");
@@ -62,7 +63,27 @@ test("projects messages, configuration, usage, interactions, and generic tools d
       modelMaxOutputTokens: 64000,
     }),
     event("config.provider", { providerId: "fixture" }),
+    event("context.resources", {
+      resources: [
+        {
+          kind: "agents",
+          scope: "project",
+          path: "/workspace/AGENTS.md",
+          content: "Use pnpm.",
+        },
+      ],
+    }),
     event("config.thinking", { requested: "high", effective: "medium", clamped: true }),
+    event("context.resources", {
+      resources: [
+        {
+          kind: "agents",
+          scope: "project",
+          path: "/workspace/packages/AGENTS.override.md",
+          content: "Use the nearest rules.",
+        },
+      ],
+    }),
     event("tool.call", { callId: "future-1", name: "future_tool", input: { value: 1 } }),
     event("tool.result", {
       callId: "future-1",
@@ -101,6 +122,14 @@ test("projects messages, configuration, usage, interactions, and generic tools d
     maxOutputTokens: null,
     httpIdleTimeoutMs: 300_000,
   });
+  assert.deepEqual(one.state.contextResources, [
+    {
+      kind: "agents",
+      scope: "project",
+      path: "/workspace/packages/AGENTS.override.md",
+      content: "Use the nearest rules.",
+    },
+  ]);
   assert.equal(one.state.lastRequest?.maxOutputTokens, 64000);
   assert.equal(one.state.tools[0]?.renderIntent, "generic");
   assert.equal(one.state.tools[0]?.result?.content[0]?.type, "text");
@@ -115,6 +144,47 @@ test("projects messages, configuration, usage, interactions, and generic tools d
   });
 });
 
+test("projects capability discovery and retains activation across operations", () => {
+  const projector = new ConversationProjector(sessionId);
+  const first = parseOperationId("00000000-0000-4000-8000-000000000091");
+  const second = parseOperationId("00000000-0000-4000-8000-000000000092");
+  const capability = {
+    identity: "skill:release",
+    kind: "skill" as const,
+    name: "release",
+    description: "Prepare releases",
+    path: "/workspace/.agents/skills/release/SKILL.md",
+    scope: "project" as const,
+    provenance: "project:/workspace/.agents/skills",
+  };
+  projector.applyEvent(event("session.created", { cwd: "/workspace" }));
+  projector.applyEvent(
+    event("user.message", { content: [{ type: "text", text: "release" }] }, null, first),
+  );
+  projector.applyEvent(
+    event(
+      "capability.searched",
+      { query: "release", limit: 5, results: [capability] },
+      null,
+      first,
+    ),
+  );
+  projector.applyEvent(
+    event("capability.activated", { capability, content: "instructions" }, null, first),
+  );
+  projector.applyEvent(
+    event("capability.denied", { identity: "skill:other", reason: "denied" }, null, first),
+  );
+  assert.equal(projector.state.capabilitySearches.length, 1);
+  assert.equal(projector.state.activeCapabilities[0]?.payload.capability.identity, "skill:release");
+  assert.equal(projector.state.capabilityDenials.length, 1);
+
+  projector.applyEvent(
+    event("user.message", { content: [{ type: "text", text: "next" }] }, null, second),
+  );
+  assert.equal(projector.state.activeCapabilities[0]?.payload.capability.identity, "skill:release");
+});
+
 test("classifies first-party tool presentation intents", () => {
   const projector = new ConversationProjector(sessionId);
   projector.applyEvent(event("session.created", { cwd: "/workspace" }));
@@ -123,12 +193,13 @@ test("classifies first-party tool presentation intents", () => {
     ["read-1", "read"],
     ["write-1", "write"],
     ["edit-1", "edit"],
+    ["mcp-1", "mcp_context7_query-docs_aef4d8b911"],
   ] as const) {
     projector.applyEvent(event("tool.call", { callId, name, input: {} }));
   }
   assert.deepEqual(
     projector.state.tools.map((tool) => tool.renderIntent),
-    ["shell", "read", "edit", "edit"],
+    ["shell", "read", "edit", "edit", "mcp"],
   );
 });
 
@@ -162,11 +233,14 @@ test("derives operation and interaction lifecycle from canonical events", () => 
     operationId,
   });
   assert.equal(projector.state.operations[0]?.status, "waiting_interaction");
+  // The daemon records the resolution under the responding RPC's operation, not the turn's.
+  const respondOperation = parseOperationId("00000000-0000-4000-8000-0000000000ee");
   projector.applyEvent({
     ...event("interaction.resolved", { interactionId: "approval-1", action: "accept" }),
-    operationId,
+    operationId: respondOperation,
   });
   assert.equal(projector.state.operations[0]?.status, "running");
+  assert.equal(projector.state.activeOperationId, operationId);
   projector.applyEvent({
     ...event("assistant.message", { content: [], stopReason: "aborted" }),
     operationId,
@@ -264,6 +338,31 @@ test("replaces activity by operation and clears it on canonical completion", () 
   assert.equal(projector.state.activity, undefined);
 });
 
+test("keeps activity live after a retryable automatic compaction failure", () => {
+  const projector = new ConversationProjector(sessionId);
+  const operationId = parseOperationId("00000000-0000-4000-8000-000000000101");
+  projector.applyActivity({ operationId, sequence: 1, type: "text_delta", text: "before" });
+  projector.applyEvent(
+    event(
+      "compaction.failed",
+      {
+        reason: "overflow",
+        code: "summarization_failed",
+        message: "retrying",
+        willRetry: true,
+      },
+      null,
+      operationId,
+    ),
+  );
+  projector.applyActivity({ operationId, sequence: 2, type: "text_delta", text: " after" });
+  assert.equal(projector.state.activity?.text, "before after");
+  assert.equal(
+    projector.state.operations.find((operation) => operation.operationId === operationId)?.status,
+    "running",
+  );
+});
+
 test("derives canonical queue lifecycle state", () => {
   const projector = new ConversationProjector(sessionId);
   const operationId = parseOperationId("00000000-0000-4000-8000-000000000077");
@@ -314,6 +413,9 @@ test("overview reads remain history-free for a 100,000-event session", () => {
     compactedEventIds: _compactedEventIds,
     tools: _tools,
     interactions: _interactions,
+    capabilitySearches: _capabilitySearches,
+    activeCapabilities: _activeCapabilities,
+    capabilityDenials: _capabilityDenials,
     operations: _operations,
     queue: _queue,
     interruptDeliveries: _interruptDeliveries,

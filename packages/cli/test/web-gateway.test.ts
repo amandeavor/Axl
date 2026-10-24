@@ -10,8 +10,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { FileCredentialStore } from "@axl/ai";
 import { MAX_WIRE_MESSAGE_BYTES, WIRE_PROTOCOL_VERSION } from "@axl/protocol";
+import { startLocalDaemon } from "@axl/runtime";
+import { connectUnixClient } from "@axl/sdk/unix";
 import WebSocket from "ws";
+import { LoungeStorage } from "../src/lounge-storage.ts";
 import {
   encodeWebSessionArtifact,
   startWebGateway,
@@ -42,6 +46,86 @@ test("web assets fail closed when missing, altered, or incompatible", async (con
     JSON.stringify({ ...metadata, wireVersion: 0 }),
   );
   await assert.rejects(verifyWebAssets(directory), /missing or incompatible/);
+});
+
+test("authenticated browser modules honor project trust and disablement", async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "axl-web-extension-gateway-"));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  const packageRoot = join(workspace, ".axl", "extensions", "example");
+  const assets = join(root, "assets");
+  const stateDirectory = join(home, "unsafe");
+  const socketPath = join(stateDirectory, "axl.sock");
+  await mkdir(join(workspace, ".git"), { recursive: true });
+  await mkdir(packageRoot, { recursive: true });
+  await mkdir(assets);
+  await writeFile(
+    join(packageRoot, "package.json"),
+    JSON.stringify({ name: "example", axl: { id: "example", apiVersion: 1, web: "./view.mjs" } }),
+  );
+  const source = "export default { manifest: { id: 'example', apiVersion: 1 } };\n";
+  await writeFile(join(packageRoot, "view.mjs"), source);
+  const html = "<div></div>";
+  await writeFile(join(assets, "index.html"), html);
+  await writeFile(
+    join(assets, "asset-metadata.json"),
+    JSON.stringify({
+      webAssetVersion: 1,
+      packageVersion: "0.0.0-test",
+      sourceRevision: "fixture",
+      wireVersion: WIRE_PROTOCOL_VERSION,
+      entrypoints: ["index.html"],
+      sha256: { "index.html": createHash("sha256").update(html).digest("hex") },
+    }),
+  );
+  const store = new FileCredentialStore(join(home, "credentials.json"));
+  await store.modify("azure-openai", () =>
+    Promise.resolve({
+      type: "api_key",
+      key: "obviously-fake-web-test-key",
+      env: { AZURE_OPENAI_BASE_URL: "https://example.invalid/openai/v1" },
+    }),
+  );
+  const daemon = await startLocalDaemon({
+    axlHome: home,
+    stateDirectory,
+    socketPath,
+    defaults: { modelId: "gpt-5", thinkingLevel: "off" },
+    store,
+    unsafe: true,
+    modelsDevAutoRefresh: { enabled: false },
+  });
+  context.after(() => daemon.stop());
+  const client = await connectUnixClient(socketPath);
+  context.after(() => client.close());
+  const opened = await client.request("session.create", { cwd: workspace });
+  const gateway = await startWebGateway({
+    socketPath,
+    assetDirectory: assets,
+    stateDirectory,
+    cwd: workspace,
+    packageVersion: "0.0.0-test",
+  });
+  context.after(() => gateway.close());
+  const launch = new URL(gateway.launchUrl);
+  const exchange = await fetch(new URL("auth/exchange", gateway.origin), {
+    method: "POST",
+    headers: { origin: launch.origin, "content-type": "application/json" },
+    body: JSON.stringify({ token: new URLSearchParams(launch.hash.slice(1)).get("token") }),
+  });
+  assert.equal(exchange.status, 200);
+  const cookie = exchange.headers.get("set-cookie")?.split(";", 1)[0];
+  assert.ok(cookie);
+  const moduleUrl = new URL(`extension/${opened.sessionId}/example.mjs`, gateway.origin);
+  const request = () => fetch(moduleUrl, { headers: { cookie } });
+  assert.equal((await request()).status, 404);
+  await client.trustExtensionProject({ sessionId: opened.sessionId, trusted: true });
+  const loaded = await request();
+  assert.equal(loaded.status, 200);
+  assert.equal(await loaded.text(), source);
+  await client.disableExtension({ sessionId: opened.sessionId, extensionId: "example" });
+  assert.equal((await request()).status, 404);
 });
 
 test("browser session artifacts round-trip only manifest-declared files", async (context) => {
@@ -277,6 +361,37 @@ test("the gateway exchanges one launch token and authenticates one daemon bridge
   });
   assert.equal(replay.status, 401);
 
+  // A second browser needs a fresh link. Issuing one retires the spent token and works once.
+  const second = new URLSearchParams(new URL(gateway.issueLaunchUrl()).hash.slice(1)).get("token");
+  assert.ok(second);
+  assert.notEqual(second, launchToken);
+  const secondExchange = await fetch(exchangeUrl, {
+    method: "POST",
+    headers: { origin, "content-type": "application/json" },
+    body: JSON.stringify({ token: second }),
+  });
+  assert.equal(secondExchange.status, 200);
+  const secondReplay = await fetch(exchangeUrl, {
+    method: "POST",
+    headers: { origin, "content-type": "application/json" },
+    body: JSON.stringify({ token: second }),
+  });
+  assert.equal(secondReplay.status, 401);
+
+  const moduleUrl = new URL(
+    "extension/123e4567-e89b-42d3-a456-426614174000/example.mjs",
+    gateway.origin,
+  );
+  assert.equal((await fetch(moduleUrl)).status, 401);
+  assert.equal(
+    (
+      await fetch(new URL("extension/bad/path.mjs", gateway.origin), {
+        headers: { cookie: cookieHeader },
+      })
+    ).status,
+    404,
+  );
+
   const bootstrap = await fetch(new URL("bootstrap", gateway.origin), {
     method: "POST",
     headers: { origin, cookie: cookieHeader },
@@ -291,6 +406,10 @@ test("the gateway exchanges one launch token and authenticates one daemon bridge
       sidebarCollapsed: false,
       changesView: "files",
       panes: ["browser", "files"],
+      theme: "system",
+      loungeOpen: true,
+      mascot: true,
+      mascotColour: "Pink",
     },
     hostCapabilities: ["project.folder.validate", "provider.auth.login"],
   });
@@ -349,7 +468,41 @@ test("the gateway exchanges one launch token and authenticates one daemon bridge
     sidebarCollapsed: true,
     changesView: "all",
     panes: ["browser", "terminal"],
+    theme: "system",
+    loungeOpen: true,
+    mascot: true,
+    mascotColour: "Pink",
   });
+  const themed = await fetch(new URL("preferences", gateway.origin), {
+    method: "POST",
+    headers: { origin, cookie: cookieHeader, "content-type": "application/json" },
+    body: JSON.stringify({
+      sidebarWidth: 300,
+      dockWidth: 720,
+      sidebarCollapsed: true,
+      changesView: "all",
+      panes: ["terminal", "browser"],
+      theme: "dark",
+    }),
+  });
+  assert.equal(themed.status, 200);
+  assert.equal(
+    JSON.parse(await readFile(join(directory, "web-preferences.json"), "utf8")).theme,
+    "dark",
+  );
+  const invalidTheme = await fetch(new URL("preferences", gateway.origin), {
+    method: "POST",
+    headers: { origin, cookie: cookieHeader, "content-type": "application/json" },
+    body: JSON.stringify({
+      sidebarWidth: 300,
+      dockWidth: 720,
+      sidebarCollapsed: true,
+      changesView: "all",
+      panes: ["terminal", "browser"],
+      theme: "neon",
+    }),
+  });
+  assert.equal(invalidTheme.status, 400);
   const invalidPanes = await fetch(new URL("preferences", gateway.origin), {
     method: "POST",
     headers: { origin, cookie: cookieHeader, "content-type": "application/json" },
@@ -565,6 +718,22 @@ test("the gateway exchanges one launch token and authenticates one daemon bridge
   );
   assert.equal(await reviewClose, 1008);
 
+  const multiRecord = new WebSocket(new URL("ws", gateway.origin), {
+    headers: { origin, cookie: cookieHeader },
+  });
+  await new Promise<void>((resolve, reject) => {
+    multiRecord.once("open", resolve);
+    multiRecord.once("error", reject);
+  });
+  const multiRecordClose = new Promise<number>((resolve) =>
+    multiRecord.once("close", (code) => resolve(code)),
+  );
+  const packed = Array.from({ length: 200 }, (_unused, id) =>
+    JSON.stringify({ kind: "request", id, method: "connection.ping", params: {} }),
+  ).join("\n");
+  multiRecord.send(`${packed}\n`);
+  assert.equal(await multiRecordClose, 1008);
+
   const flooded = new WebSocket(new URL("ws", gateway.origin), {
     headers: { origin, cookie: cookieHeader },
   });
@@ -644,4 +813,152 @@ test("the gateway exchanges one launch token and authenticates one daemon bridge
     ),
   ]);
   assert.ok(performance.now() - stalledAt >= 4_000);
+});
+
+test("a damaged Lounge settings file does not stop the web bootstrap", async (context) => {
+  const directory = await mkdtemp(join(tmpdir(), "axl-web-lounge-bad-"));
+  context.after(() => rm(directory, { recursive: true, force: true }));
+  const html = '<div id="root"></div>';
+  await writeFile(join(directory, "index.html"), html);
+  await writeFile(
+    join(directory, "asset-metadata.json"),
+    JSON.stringify({
+      webAssetVersion: 1,
+      packageVersion: "0.0.0-test",
+      sourceRevision: "fixture",
+      wireVersion: WIRE_PROTOCOL_VERSION,
+      entrypoints: ["index.html"],
+      sha256: { "index.html": createHash("sha256").update(html).digest("hex") },
+    }),
+  );
+  const loungeDirectory = join(directory, "lounge");
+  await mkdir(loungeDirectory, { recursive: true, mode: 0o700 });
+  await writeFile(join(loungeDirectory, "settings.json"), "{not json", { mode: 0o600 });
+  const token = Buffer.alloc(32, 31);
+  const gateway = await startWebGateway({
+    socketPath: join(directory, "unused.sock"),
+    assetDirectory: directory,
+    stateDirectory: directory,
+    cwd: "/workspace",
+    packageVersion: "0.0.0-test",
+    launchToken: token,
+    pathToken: Buffer.alloc(16, 31),
+    lounge: new LoungeStorage(loungeDirectory),
+  });
+  context.after(() => gateway.close());
+  const origin = new URL(gateway.origin).origin;
+  const exchange = await fetch(new URL("auth/exchange", gateway.origin), {
+    method: "POST",
+    headers: { origin, "content-type": "application/json" },
+    body: JSON.stringify({ token: token.toString("base64url") }),
+  });
+  const cookie = exchange.headers.get("set-cookie")?.split(";", 1)[0] ?? "";
+  const response = await fetch(new URL("bootstrap", gateway.origin), {
+    method: "POST",
+    headers: { origin, cookie, "content-type": "application/json" },
+    body: "{}",
+  });
+  assert.equal(response.status, 200);
+  const lounge = ((await response.json()) as { lounge: { settings: unknown; error?: string } })
+    .lounge;
+  assert.deepEqual(lounge.settings, { version: 1, reducedMotion: false, textOnly: false });
+  assert.equal(typeof lounge.error, "string");
+});
+
+test("the gateway brokers Lounge saves and settings only when Lounge is enabled", async (context) => {
+  const directory = await mkdtemp(join(tmpdir(), "axl-web-lounge-"));
+  context.after(() => rm(directory, { recursive: true, force: true }));
+  const html = '<div id="root"></div>';
+  await writeFile(join(directory, "index.html"), html);
+  await writeFile(
+    join(directory, "asset-metadata.json"),
+    JSON.stringify({
+      webAssetVersion: 1,
+      packageVersion: "0.0.0-test",
+      sourceRevision: "fixture",
+      wireVersion: WIRE_PROTOCOL_VERSION,
+      entrypoints: ["index.html"],
+      sha256: { "index.html": createHash("sha256").update(html).digest("hex") },
+    }),
+  );
+  const open = async (lounge: boolean, seed: number) => {
+    const token = Buffer.alloc(32, seed);
+    const gateway = await startWebGateway({
+      socketPath: join(directory, "unused.sock"),
+      assetDirectory: directory,
+      stateDirectory: directory,
+      cwd: "/workspace",
+      packageVersion: "0.0.0-test",
+      launchToken: token,
+      pathToken: Buffer.alloc(16, seed),
+      ...(lounge ? { lounge: new LoungeStorage(join(directory, "lounge")) } : {}),
+    });
+    context.after(() => gateway.close());
+    const origin = new URL(gateway.origin).origin;
+    const exchange = await fetch(new URL("auth/exchange", gateway.origin), {
+      method: "POST",
+      headers: { origin, "content-type": "application/json" },
+      body: JSON.stringify({ token: token.toString("base64url") }),
+    });
+    const cookie = exchange.headers.get("set-cookie")?.split(";", 1)[0] ?? "";
+    const post = (path: string, body: unknown) =>
+      fetch(new URL(path, gateway.origin), {
+        method: "POST",
+        headers: { origin, cookie, "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    return { post, gateway, origin, cookie };
+  };
+
+  const off = await open(false, 21);
+  assert.equal((await off.post("lounge/storage", { op: "read" })).status, 404);
+  assert.equal(
+    ((await (await off.post("bootstrap", {})).json()) as { lounge?: unknown }).lounge,
+    undefined,
+  );
+
+  const on = await open(true, 22);
+  const unauthenticated = await fetch(new URL("lounge/storage", on.gateway.origin), {
+    method: "POST",
+    headers: { origin: on.origin, "content-type": "application/json" },
+    body: "{}",
+  });
+  assert.equal(unauthenticated.status, 401);
+  assert.deepEqual(
+    ((await (await on.post("bootstrap", {})).json()) as { lounge: unknown }).lounge,
+    { settings: { version: 1, reducedMotion: false, textOnly: false } },
+  );
+  const scope = { extensionId: "axl.lounge", activityId: "axl.lounge.2048" };
+  assert.deepEqual(await (await on.post("lounge/storage", { op: "read", scope })).json(), {
+    value: null,
+  });
+  const written = await on.post("lounge/storage", {
+    op: "write",
+    scope,
+    expectedRevision: null,
+    schemaVersion: 1,
+    value: { best: 8 },
+  });
+  assert.deepEqual(await written.json(), { revision: 1, schemaVersion: 1, value: { best: 8 } });
+  const conflict = await on.post("lounge/storage", {
+    op: "write",
+    scope,
+    expectedRevision: null,
+    schemaVersion: 1,
+    value: { best: 9 },
+  });
+  assert.equal(conflict.status, 422);
+  assert.equal(((await conflict.json()) as { code: string }).code, "conflict");
+  assert.equal(
+    (await on.post("lounge/storage", { op: "read", scope: { ...scope, extra: 1 } })).status,
+    400,
+  );
+  assert.equal(
+    (
+      (await (await on.post("lounge/settings", { update: { textOnly: true } })).json()) as {
+        textOnly: boolean;
+      }
+    ).textOnly,
+    true,
+  );
 });

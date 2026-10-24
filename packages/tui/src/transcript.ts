@@ -5,6 +5,11 @@
 // SPDX-FileCopyrightText: 2026 Shaan Narendran
 // SPDX-License-Identifier: Apache-2.0
 
+import type {
+  ActivityBackgroundStyle,
+  TerminalExtensionHost,
+  TerminalLine,
+} from "@axl/extension-api";
 import type { BlobReference, CanonicalEvent } from "@axl/protocol";
 import {
   type CanonicalPresentationItem,
@@ -13,6 +18,7 @@ import {
   presentCanonicalEvent,
 } from "@axl/sdk";
 
+import { renderExtensionLines } from "./extension-ui.ts";
 import { renderMarkdown } from "./markdown.ts";
 import { sanitizeTerminalText, truncateToWidth, visibleWidth, wrapLine } from "./render.ts";
 import { renderShellPassthrough } from "./tool-display.ts";
@@ -28,6 +34,7 @@ export interface Palette {
   text?(text: string): string;
   userMessage?(text: string): string;
   selection?(text: string): string;
+  activityBackground?(role: ActivityBackgroundStyle, text: string): string;
   searchMatch?(text: string): string;
   searchCurrent?(text: string): string;
   toolBackground?(text: string): string;
@@ -65,6 +72,7 @@ export const PLAIN_PALETTE: Palette = {
   accent: (text) => text,
   error: (text) => text,
   bold: (text) => text,
+  activityBackground: (_role, text) => text,
 };
 
 const EMPTY_ROWS: readonly string[] = Object.freeze([]);
@@ -81,6 +89,23 @@ export const ANSI_PALETTE: Palette = {
   border: (text) => `\x1b[90m${text}\x1b[39m`,
   success: (text) => `\x1b[32m${text}\x1b[39m`,
   warning: (text) => `\x1b[33m${text}\x1b[39m`,
+  activityBackground: (role, text) => {
+    const color =
+      role === "surface"
+        ? 238
+        : role === "surfaceAlternate"
+          ? 241
+          : role === "accent"
+            ? 24
+            : role === "selection"
+              ? 25
+              : role === "success"
+                ? 28
+                : role === "warning"
+                  ? 94
+                  : 52;
+    return `\x1b[48;5;${color}m${text}\x1b[49m`;
+  },
   diffAdded: (text) => `\x1b[32m${text}\x1b[39m`,
   diffRemoved: (text) => `\x1b[31m${text}\x1b[39m`,
   diffContext: (text) => `\x1b[2m${text}\x1b[22m`,
@@ -118,6 +143,7 @@ export class SessionView {
   private width: number;
   private models: readonly ClientModelInfo[];
   private readonly renderBlob: BlobRenderer | undefined;
+  private readonly extensionHost: (() => TerminalExtensionHost) | undefined;
   provider: string | undefined;
   model: string | undefined;
   thinking: string | undefined;
@@ -147,12 +173,14 @@ export class SessionView {
     models: readonly ClientModelInfo[] = [],
     renderBlob?: BlobRenderer,
     projection: ConversationProjector = new ConversationProjector(),
+    extensionHost?: () => TerminalExtensionHost,
   ) {
     this.width = width;
     this.palette = palette;
     this.models = models;
     this.renderBlob = renderBlob;
     this.projection = projection;
+    this.extensionHost = extensionHost;
   }
 
   setWidth(width: number): void {
@@ -264,7 +292,7 @@ export class SessionView {
     const previousModel = this.model;
     const previousThinking = this.thinking;
     const previousSandbox = this.sandbox;
-    const projected = this.projection.state;
+    const projected = this.projection.overview;
     this.provider = projected.provider;
     this.model = projected.model;
     this.thinking = projected.thinking;
@@ -290,20 +318,52 @@ export class SessionView {
       case "interrupt.requested":
       case "interrupt.updated":
       case "config.request":
+      case "config.compaction":
       case "model.request_configured":
       case "config.entitlement":
       case "config.profile":
       case "config.tools":
+      case "context.resources":
       case "prompt.section":
       case "tool.schema":
-      case "context.extension":
+      case "extension.label":
+      case "capability.searched":
+      case "capability.activated":
+      case "capability.denied":
       case "interaction.requested":
       case "interaction.resolved":
       case "child.result":
         return EMPTY_ROWS;
+      case "extension.state":
+        return this.extensionRows(
+          this.extensionHost?.().renderCanonicalEntry(
+            event.payload.key,
+            event.payload.value,
+            this.width,
+          ),
+        );
+      case "extension.event":
+        return this.extensionRows(
+          this.extensionHost?.().renderCanonicalEntry(
+            event.payload.channel,
+            event.payload.value,
+            this.width,
+          ),
+        );
+      case "context.extension":
+        return this.extensionRows(
+          this.extensionHost?.().renderMessage(
+            event.payload.source,
+            event.payload.content,
+            this.width,
+          ),
+        );
       case "user.message":
         return [
-          ...this.userMessage(textOf(event.payload.content)),
+          ...this.userMessage(
+            this.extensionHost?.().transformMarkdown(textOf(event.payload.content), "user") ??
+              textOf(event.payload.content),
+          ),
           ...event.payload.content.flatMap((item) =>
             item.type === "blob" ? this.blobRows(item.blob) : [],
           ),
@@ -377,7 +437,9 @@ export class SessionView {
           } else if (item.type === "text") {
             lines.push(
               ...renderMarkdown(
-                sanitizeTerminalText(item.text),
+                sanitizeTerminalText(
+                  this.extensionHost?.().transformMarkdown(item.text, "assistant") ?? item.text,
+                ),
                 Math.max(1, this.width - 2),
                 this.palette,
               ),
@@ -468,6 +530,16 @@ export class SessionView {
         );
       case "context.injected":
         return this.wrap(dim(`+ context [${sanitizeTerminalText(event.payload.source)}]`));
+      case "compaction.queued":
+        return this.wrap(dim("· compaction queued after the active response"));
+      case "compaction.started":
+        return [];
+      case "compaction.failed":
+        return this.wrap(
+          (this.palette.warning ?? error)(
+            `! compaction failed: ${sanitizeTerminalText(event.payload.message)}`,
+          ),
+        );
       case "context.compacted":
         this.contextTokens = undefined;
         this.cacheHitPercent = undefined;
@@ -487,6 +559,17 @@ export class SessionView {
       default:
         return assertNever(event);
     }
+  }
+
+  private extensionRows(lines: readonly TerminalLine[] | undefined): readonly string[] {
+    return lines === undefined || lines.length === 0
+      ? EMPTY_ROWS
+      : [
+          "",
+          ...renderExtensionLines(lines, Math.max(1, this.width - 2), this.palette).map(
+            (line) => `  ${line}`,
+          ),
+        ];
   }
 
   statusLine(sessionId: string, spinner?: string, queued = 0): string {

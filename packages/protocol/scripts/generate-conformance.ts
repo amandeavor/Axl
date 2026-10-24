@@ -106,6 +106,7 @@ const eventPayloads = {
     details: { lines: 1 },
   },
   "config.request": { maxOutputTokens: null, httpIdleTimeoutMs: 300_000 },
+  "config.compaction": { enabled: true, reserveTokens: 16_384, keepRecentTokens: 20_000 },
   "model.request_configured": {
     maxOutputTokens: 8192,
     httpIdleTimeoutMs: 300_000,
@@ -126,25 +127,78 @@ const eventPayloads = {
     reason: "model_switch",
   },
   "prompt.section": { name: "identity", source: "core", content: "You are Axl." },
+  "context.resources": {
+    resources: [
+      {
+        kind: "agents",
+        scope: "project",
+        path: "/workspace/AGENTS.md",
+        content: "Use pnpm.",
+      },
+    ],
+  },
   "tool.schema": {
     name: "read",
     description: "Read a file",
     inputSchema: { type: "object", required: ["path"] },
   },
   "context.injected": { source: "skill", content: "Follow this procedure." },
+  "extension.state": { extensionId: "example", key: "count", value: 1 },
+  "extension.label": { extensionId: "example", eventId, label: "important" },
+  "extension.event": { extensionId: "example", channel: "changed", value: { count: 1 } },
   "context.extension": {
     extensionId: "example",
     source: "hook",
     content: "Additional context",
   },
+  "capability.searched": {
+    query: "publish release",
+    limit: 5,
+    results: [
+      {
+        identity: "skill:release",
+        kind: "skill",
+        name: "release",
+        description: "Prepare and publish releases",
+        path: "/workspace/.agents/skills/release/SKILL.md",
+        scope: "project",
+        provenance: "project:/workspace/.agents/skills",
+      },
+    ],
+  },
+  "capability.activated": {
+    capability: {
+      identity: "skill:release",
+      kind: "skill",
+      name: "release",
+      description: "Prepare and publish releases",
+      path: "/workspace/.agents/skills/release/SKILL.md",
+      scope: "project",
+      provenance: "project:/workspace/.agents/skills",
+    },
+    content:
+      '<skill name="release" path="/workspace/.agents/skills/release/SKILL.md">\nPublish safely.\n</skill>',
+  },
+  "capability.denied": { identity: "skill:unsafe", reason: "capability is not trusted" },
   "permission.requested": { capability: "filesystem.write", description: "Write README.md" },
   "permission.resolved": { requestId: eventId, decision: "allow_once" },
   "interaction.requested": {
     interactionId: "interaction-1",
-    kind: "mcp_elicitation_form",
-    source: "mcp:example",
-    message: "Choose a value",
-    data: { requestedSchema: { type: "object" } },
+    kind: "user_question",
+    source: "ask_user_question",
+    message: "Choose a value?",
+    data: {
+      questions: [
+        {
+          header: "Choice",
+          question: "Choose a value?",
+          options: [
+            { label: "One", description: "Choose one" },
+            { label: "Two", description: "Choose two" },
+          ],
+        },
+      ],
+    },
   },
   "interaction.resolved": {
     interactionId: "interaction-1",
@@ -158,7 +212,28 @@ const eventPayloads = {
     details: { landlock: "full" },
   },
   "sandbox.violation": { capability: "filesystem.write", reason: "outside workspace" },
-  "context.compacted": { summary: "Earlier work", replacedEventIds: [otherEventId] },
+  "compaction.queued": { instructions: "Keep decisions" },
+  "compaction.started": {
+    reason: "manual",
+    estimatedInputTokens: 50_000,
+    contextWindow: 128_000,
+    reserveTokens: 16_384,
+    keepRecentTokens: 20_000,
+  },
+  "compaction.failed": {
+    reason: "overflow",
+    code: "summarization_failed",
+    message: "Provider unavailable",
+    willRetry: false,
+  },
+  "context.compacted": {
+    summary: "Earlier work",
+    replacedEventIds: [otherEventId],
+    reason: "manual",
+    willRetry: false,
+    readFiles: ["README.md"],
+    modifiedFiles: ["src/main.ts"],
+  },
   "session.error": { code: "provider_failed", message: "Provider unavailable", retryable: true },
   "child.result": {
     childSessionId: otherSessionId,
@@ -197,11 +272,40 @@ const params = {
   "provider.auth.status": { providerId: "provider-1" },
   "provider.auth.login": { providerId: "provider-1", method: "oauth" },
   "provider.auth.logout": { providerId: "provider-1" },
+  "extension.list": { sessionId },
+  "extension.enable": { sessionId, extensionId: "example" },
+  "extension.disable": { sessionId, extensionId: "example" },
+  "extension.reload": { sessionId, extensionId: "example" },
+  "extension.install": { sessionId, source: { type: "npm", spec: "@example/axl-extension" } },
+  "extension.update": { sessionId, extensionId: "example" },
+  "extension.remove": { sessionId, extensionId: "example" },
+  "extension.trust": { sessionId, trusted: true },
+  "extension.command.invoke": { sessionId, name: "example-command", args: { value: 1 } },
+  "mcp.config.list": {},
+  "mcp.config.upsert": {
+    name: "docs",
+    definition: {
+      url: "https://mcp.example.com/mcp",
+      headers: { Authorization: "Bearer ${DOCS_TOKEN}" },
+    },
+  },
+  "mcp.config.batch": {
+    servers: [
+      { name: "docs", definition: { url: "https://mcp.example.com/mcp" } },
+      { name: "local", definition: { command: "example-mcp-server" } },
+    ],
+  },
+  "mcp.config.remove": { name: "docs" },
+  "mcp.config.probe": {
+    name: "docs",
+    definition: { url: "https://mcp.example.com/mcp", headers: { Authorization: "DOCS_TOKEN" } },
+  },
   "session.create": {
     cwd: "/workspace",
     providerId: "provider-1",
     modelId: "model-1",
     profile: "standard",
+    userQuestions: true,
   },
   "session.resume": { sessionId },
   "session.list": { scope: "all_local", order: "recent", pageSize: 50 },
@@ -279,6 +383,10 @@ const entry = {
   binary: false,
   submodule: false,
 } as const;
+const extensionCommands = [
+  { extensionId: "example", name: "example-command", description: "Example command" },
+];
+
 const results = {
   "daemon.info": { securityMode: "sandboxed", sandboxProvider: "bubblewrap" },
   "connection.initialize": {
@@ -363,6 +471,146 @@ const results = {
     source: "OAuth",
   },
   "provider.auth.logout": { providerId: "provider-1", phase: "logged_out" },
+  "mcp.config.list": {
+    path: "/home/user/.axl/mcp.json",
+    servers: [
+      {
+        name: "docs",
+        definition: {
+          url: "https://mcp.example.com/mcp",
+          headers: { Authorization: "DOCS_TOKEN" },
+        },
+        status: "discovered",
+        tools: [{ name: "search_docs", description: "Search the documentation." }],
+        discoveredAt: 1,
+      },
+      {
+        name: "local",
+        definition: { command: "example-mcp-server", enabled: false },
+        status: "disabled",
+        tools: [],
+      },
+      {
+        name: "broken",
+        definition: { url: "https://broken.example.com/mcp" },
+        status: "failed",
+        tools: [],
+        error: "endpoint returned HTTP 404",
+      },
+    ],
+  },
+  "extension.list": {
+    configPath: "/home/user/.axl/extensions.json",
+    project: { root: "/workspace", trusted: false },
+    extensions: [
+      {
+        id: "example",
+        path: "/home/user/.axl/extensions/example.ts",
+        source: "global",
+        enabled: true,
+      },
+    ],
+    commands: extensionCommands,
+  },
+  "extension.enable": {
+    configPath: "/home/user/.axl/extensions.json",
+    project: { root: "/workspace", trusted: false },
+    extensions: [],
+    commands: extensionCommands,
+    changedExtensionId: "example",
+    boundaryEventIds: [eventId],
+  },
+  "extension.disable": {
+    configPath: "/home/user/.axl/extensions.json",
+    project: { root: "/workspace", trusted: false },
+    extensions: [],
+    commands: extensionCommands,
+    changedExtensionId: "example",
+    boundaryEventIds: [eventId],
+  },
+  "extension.reload": {
+    configPath: "/home/user/.axl/extensions.json",
+    project: { root: "/workspace", trusted: false },
+    extensions: [],
+    commands: extensionCommands,
+    changedExtensionId: "example",
+    boundaryEventIds: [eventId],
+  },
+  "extension.install": {
+    configPath: "/home/user/.axl/extensions.json",
+    project: { root: "/workspace", trusted: false },
+    extensions: [],
+    commands: extensionCommands,
+    changedExtensionId: "example",
+    boundaryEventIds: [eventId],
+  },
+  "extension.update": {
+    configPath: "/home/user/.axl/extensions.json",
+    project: { root: "/workspace", trusted: false },
+    extensions: [],
+    commands: extensionCommands,
+    changedExtensionId: "example",
+    boundaryEventIds: [eventId],
+  },
+  "extension.remove": {
+    configPath: "/home/user/.axl/extensions.json",
+    project: { root: "/workspace", trusted: false },
+    extensions: [],
+    commands: extensionCommands,
+    changedExtensionId: "example",
+    boundaryEventIds: [eventId],
+  },
+  "extension.trust": {
+    configPath: "/home/user/.axl/extensions.json",
+    project: { root: "/workspace", trusted: true },
+    extensions: [],
+    commands: extensionCommands,
+    boundaryEventIds: [eventId],
+  },
+  "extension.command.invoke": { content: "done" },
+  "mcp.config.upsert": {
+    path: "/home/user/.axl/mcp.json",
+    servers: [
+      {
+        name: "docs",
+        definition: {
+          url: "https://mcp.example.com/mcp",
+          headers: { Authorization: "DOCS_TOKEN" },
+        },
+        status: "pending",
+        tools: [],
+      },
+    ],
+    changed: true,
+  },
+  "mcp.config.batch": {
+    path: "/home/user/.axl/mcp.json",
+    servers: [
+      {
+        name: "docs",
+        definition: { url: "https://mcp.example.com/mcp" },
+        status: "pending",
+        tools: [],
+      },
+      {
+        name: "local",
+        definition: { command: "example-mcp-server" },
+        status: "pending",
+        tools: [],
+      },
+    ],
+    changed: true,
+  },
+  "mcp.config.remove": {
+    path: "/home/user/.axl/mcp.json",
+    servers: [],
+    changed: true,
+  },
+  "mcp.config.probe": {
+    protocolVersion: "2025-11-25",
+    tools: [],
+    authorization: "required",
+  },
   "session.create": opened,
   "session.resume": opened,
   "session.list": {
@@ -403,7 +651,7 @@ const results = {
     stopReason: "stop",
     targetOperationId: operationId,
   },
-  "session.compact": { eventId },
+  "session.compact": { state: "completed", operationId, eventId },
   "session.queue.enqueue": { queueItemId: eventId, state: "queued" },
   "session.queue.requeue": { queueItemId: eventId, state: "queued" },
   "session.queue.restore": {
@@ -430,6 +678,7 @@ const results = {
     profile: "standard",
     webFetch: true,
     webSearch: false,
+    userQuestions: true,
     boundaryEventIds: [eventId],
   },
   "session.interaction.respond": {

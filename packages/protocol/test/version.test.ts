@@ -8,7 +8,7 @@ import test from "node:test";
 
 import { EVENT_FORMAT_VERSION, WIRE_PROTOCOL_VERSION } from "../src/index.ts";
 
-test("keeps event format 1 and adds queue restoration in wire protocol 16", () => {
+test("keeps event format 1 and adds browser entry paths in wire protocol 30", () => {
   assert.equal(EVENT_FORMAT_VERSION, 1);
-  assert.equal(WIRE_PROTOCOL_VERSION, 16);
+  assert.equal(WIRE_PROTOCOL_VERSION, 30);
 });

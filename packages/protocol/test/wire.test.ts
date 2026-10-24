@@ -247,6 +247,12 @@ test("validates every request shape", () => {
     },
     {
       kind: "request",
+      id: 81,
+      method: "session.configure",
+      params: { sessionId, userQuestions: false },
+    },
+    {
+      kind: "request",
       id: 9,
       method: "session.create",
       params: {
@@ -341,6 +347,29 @@ test("validates every request shape", () => {
       : request;
     assert.deepEqual(parseWireRequest(keyed), keyed);
   }
+});
+
+test("defaults legacy session configuration results to non-interactive", () => {
+  const result = {
+    providerId: "openai",
+    modelId: "gpt-5",
+    requestedThinkingLevel: "medium",
+    effectiveThinkingLevel: "medium",
+    requestSettings: { maxOutputTokens: null, httpIdleTimeoutMs: 300_000 },
+    profile: "standard",
+    webFetch: true,
+    webSearch: true,
+    boundaryEventIds: [],
+  } as const;
+  assert.deepEqual(
+    parseServerMessage({ kind: "success", id: 1, method: "session.configure", result }),
+    {
+      kind: "success",
+      id: 1,
+      method: "session.configure",
+      result: { ...result, userQuestions: false },
+    },
+  );
 });
 
 test("requires idempotency keys only for retryable mutations", () => {
@@ -742,12 +771,24 @@ test("validates server messages and newline framing", () => {
           lastUserMessage: "hello",
           runtime: { state: "idle" },
           attachmentCount: 1,
+          profile: "chat",
         },
       ],
       nextPageCursor: "page-2",
     },
   } as const;
   assert.deepEqual(parseServerMessage(listed), listed);
+  assert.throws(
+    () =>
+      parseServerMessage({
+        ...listed,
+        result: {
+          ...listed.result,
+          sessions: [{ ...listed.result.sessions[0], profile: "invalid" }],
+        },
+      }),
+    ProtocolValidationError,
+  );
   assert.throws(
     () =>
       parseServerMessage({
